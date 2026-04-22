@@ -1,0 +1,118 @@
+{
+  "projectType": "framework",
+  "projectName": "Eino",
+  "projectDescription": "A production-grade Go framework for building LLM/AI applications with composable components, graph-based orchestration, and a full Agent Development Kit.",
+  "theme": "luma",
+  "primaryColor": "#04e5d4",
+  "lightColor": "#ffffff",
+  "darkColor": null,
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "installation"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/overview",
+              "concepts/components",
+              "concepts/composition",
+              "concepts/agents"
+            ]
+          },
+          {
+            "group": "Composition",
+            "pages": [
+              "composition/graph",
+              "composition/chain",
+              "composition/workflow",
+              "composition/streaming"
+            ]
+          },
+          {
+            "group": "Agent Development Kit",
+            "pages": [
+              "adk/chat-model-agent",
+              "adk/multi-agent",
+              "adk/human-in-the-loop",
+              "adk/prebuilt-patterns"
+            ]
+          },
+          {
+            "group": "Observability",
+            "pages": [
+              "observability/callbacks",
+              "observability/checkpoints"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Components",
+            "pages": [
+              "api/chat-model",
+              "api/tool",
+              "api/retriever",
+              "api/embedding",
+              "api/prompt"
+            ]
+          },
+          {
+            "group": "Compose",
+            "pages": [
+              "api/graph",
+              "api/runnable"
+            ]
+          },
+          {
+            "group": "Schema",
+            "pages": [
+              "api/message",
+              "api/stream"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Composable component system (ChatModel, Tool, Retriever, Embedding, Prompt, Indexer, Document)",
+    "Graph-based orchestration with DAG and Pregel execution modes supporting cycles",
+    "Agent Development Kit (ADK) for building single and multi-agent systems",
+    "Automatic stream processing — concatenation, boxing, merging, and fan-out across nodes",
+    "Callback aspects for logging, tracing, and metrics at OnStart/OnEnd/OnError lifecycle points",
+    "Interrupt/Resume for human-in-the-loop workflows with checkpoint-based state persistence",
+    "Prebuilt agent patterns: DeepAgent, Supervisor, Plan-Execute",
+    "Type-safe generics throughout — Graph[I, O], Chain[I, O], Workflow[I, O]"
+  ],
+  "publicApiSurface": [
+    "compose.NewGraph[I, O]() *Graph[I, O]",
+    "compose.NewChain[I, O]() *Chain[I, O]",
+    "compose.NewWorkflow[I, O]() *Workflow[I, O]",
+    "adk.NewChatModelAgent(ctx, *ChatModelAgentConfig) (Agent, error)",
+    "adk.NewRunner(ctx, RunnerConfig) *Runner",
+    "adk.Agent interface { Name, Description, Run }",
+    "model.BaseChatModel interface { Generate, Stream }",
+    "model.ToolCallingChatModel interface { BaseChatModel, WithTools }",
+    "callbacks.Handler interface { OnStart, OnEnd, OnError, OnStartWithStreamInput, OnEndWithStreamOutput }",
+    "callbacks.AppendGlobalHandlers(handlers ...Handler)",
+    "compose.WithCheckPointStore(store CheckPointStore) GraphCompileOption",
+    "schema.Message, schema.StreamReader[T]",
+    "components/tool.BaseTool, InvokableTool",
+    "components/retriever.Retriever",
+    "components/embedding.Embedder",
+    "adk/prebuilt/deep.New(ctx, *Config) (Agent, error)",
+    "adk/prebuilt/supervisor.New(ctx, *Config) (Agent, error)"
+  ]
+}

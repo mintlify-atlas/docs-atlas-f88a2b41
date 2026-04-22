@@ -1,0 +1,309 @@
+---
+title: "Embedder API reference"
+description: "Complete reference for the Embedder interface, embedding Options, callback types, and RAG pipeline integration in the Eino Go LLM framework."
+---
+
+The `embedding` package defines the `Embedder` interface, which converts a batch of strings into dense vector representations. Both `Indexer` and `Retriever` components depend on an `Embedder` to turn documents and queries into comparable vectors. The indexer and retriever in a given pipeline must share the exact same embedding model — mismatched model families or dimensions break semantic similarity.
+
+## Interface
+
+### Embedder
+
+```go
+type Embedder interface {
+    EmbedStrings(ctx context.Context, texts []string, opts ...Option) ([][]float64, error)
+}
+```
+
+#### EmbedStrings
+
+<ParamField path="ctx" type="context.Context" required>
+  Request context. Use it to carry deadlines and cancellation signals.
+</ParamField>
+
+<ParamField path="texts" type="[]string" required>
+  A batch of strings to embed. The method returns one vector per input string, in the same order. Batching multiple strings in a single call is more efficient than calling `EmbedStrings` once per string.
+</ParamField>
+
+<ParamField path="opts" type="...Option">
+  Zero or more call-time options. Currently only `WithModel` is defined as a standard option; use `WrapImplSpecificOptFn` for backend-specific parameters.
+</ParamField>
+
+<ResponseField name="[][]float64" type="[][]float64">
+  A slice where `embeddings[i]` is the vector for `texts[i]`. All vectors have the same length, which is fixed by the underlying model (e.g. 1536 dimensions for `text-embedding-ada-002`).
+</ResponseField>
+
+<ResponseField name="error" type="error">
+  Non-nil on network errors, context cancellation, or backend API errors.
+</ResponseField>
+
+---
+
+## Options
+
+### Option constructors
+
+<ParamField path="WithModel(model string)" type="Option">
+  Overrides the embedding model name for this call (e.g. `"text-embedding-3-small"`). Useful when an implementation supports multiple models.
+</ParamField>
+
+### Options struct
+
+```go
+type Options struct {
+    Model *string
+}
+```
+
+Inside your `EmbedStrings` implementation, call `GetCommonOptions` to merge caller-provided options onto your defaults:
+
+```go
+func (e *MyEmbedder) EmbedStrings(ctx context.Context, texts []string, opts ...embedding.Option) ([][]float64, error) {
+    options := embedding.GetCommonOptions(&embedding.Options{Model: &e.defaultModel}, opts...)
+    model := *options.Model
+    // use model to route the request
+}
+```
+
+### Implementation-specific options
+
+Use `WrapImplSpecificOptFn` to expose backend-specific parameters alongside the standard `WithModel` option:
+
+```go
+// In your implementation package:
+func WithEncodingFormat(format string) embedding.Option {
+    return embedding.WrapImplSpecificOptFn(func(o *MyOptions) {
+        o.EncodingFormat = format
+    })
+}
+```
+
+Retrieve them inside `EmbedStrings` with `GetImplSpecificOptions`:
+
+```go
+myOpts := embedding.GetImplSpecificOptions(&MyOptions{EncodingFormat: "float"}, opts...)
+```
+
+---
+
+## Callback types
+
+Use `ConvCallbackInput` and `ConvCallbackOutput` to cast the raw `callbacks.CallbackInput` / `callbacks.CallbackOutput` interfaces into typed embedding structs inside your callback handler.
+
+### CallbackInput
+
+```go
+type CallbackInput struct {
+    Texts  []string
+    Config *Config
+    Extra  map[string]any
+}
+```
+
+<ResponseField name="Texts" type="[]string">
+  The input strings passed to `EmbedStrings`.
+</ResponseField>
+
+<ResponseField name="Config" type="*Config">
+  Active model configuration snapshot.
+
+  <Expandable title="Config fields">
+    <ResponseField name="Model" type="string">The embedding model name in use.</ResponseField>
+    <ResponseField name="EncodingFormat" type="string">The encoding format (e.g. `"float"`, `"base64"`).</ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="Extra" type="map[string]any">
+  Implementation-specific metadata.
+</ResponseField>
+
+### CallbackOutput
+
+```go
+type CallbackOutput struct {
+    Embeddings [][]float64
+    Config     *Config
+    TokenUsage *TokenUsage
+    Extra      map[string]any
+}
+```
+
+<ResponseField name="Embeddings" type="[][]float64">
+  The vectors produced for the input texts.
+</ResponseField>
+
+<ResponseField name="Config" type="*Config">
+  Configuration snapshot for the call.
+</ResponseField>
+
+<ResponseField name="TokenUsage" type="*TokenUsage">
+  Token usage for the embedding request.
+
+  <Expandable title="TokenUsage fields">
+    <ResponseField name="PromptTokens" type="int">Input tokens consumed.</ResponseField>
+    <ResponseField name="CompletionTokens" type="int">Completion tokens (typically 0 for embeddings).</ResponseField>
+    <ResponseField name="TotalTokens" type="int">Total tokens billed.</ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="Extra" type="map[string]any">
+  Implementation-specific metadata.
+</ResponseField>
+
+---
+
+## Embedding in a RAG pipeline
+
+In a typical RAG setup you pass the same `Embedder` to both the `Indexer` (at write time) and the `Retriever` (at query time). Mixing models corrupts similarity scores.
+
+<Tabs>
+  <Tab title="Index-time embedding">
+    ```go
+    package main
+
+    import (
+        "context"
+
+        "github.com/cloudwego/eino/components/embedding"
+        // replace with your backend
+        "github.com/cloudwego/eino-ext/components/embedding/openai"
+        "github.com/cloudwego/eino-ext/components/indexer/redis"
+    )
+
+    func indexDocuments(ctx context.Context, docs []*schema.Document) {
+        emb, err := openai.NewEmbedder(ctx, &openai.EmbeddingConfig{
+            Model: "text-embedding-3-small",
+        })
+        if err != nil {
+            panic(err)
+        }
+
+        indexer, err := redis.NewIndexer(ctx, &redis.IndexerConfig{
+            Address:   "localhost:6379",
+            Embedding: emb,
+        })
+        if err != nil {
+            panic(err)
+        }
+
+        if err := indexer.Store(ctx, docs); err != nil {
+            panic(err)
+        }
+    }
+    ```
+  </Tab>
+  <Tab title="Query-time retrieval">
+    ```go
+    package main
+
+    import (
+        "context"
+        "fmt"
+
+        "github.com/cloudwego/eino/components/retriever"
+        "github.com/cloudwego/eino-ext/components/embedding/openai"
+        redisret "github.com/cloudwego/eino-ext/components/retriever/redis"
+    )
+
+    func queryDocuments(ctx context.Context, query string) {
+        // Must be the same model used at index time.
+        emb, err := openai.NewEmbedder(ctx, &openai.EmbeddingConfig{
+            Model: "text-embedding-3-small",
+        })
+        if err != nil {
+            panic(err)
+        }
+
+        ret, err := redisret.NewRetriever(ctx, &redisret.RetrieverConfig{
+            Address:   "localhost:6379",
+            Embedding: emb,
+            TopK:      5,
+        })
+        if err != nil {
+            panic(err)
+        }
+
+        docs, err := ret.Retrieve(ctx, query,
+            retriever.WithScoreThreshold(0.6),
+        )
+        if err != nil {
+            panic(err)
+        }
+
+        for _, doc := range docs {
+            fmt.Printf("[%.2f] %s\n", doc.Score(), doc.Content)
+        }
+    }
+    ```
+  </Tab>
+  <Tab title="Standalone embedding">
+    ```go
+    package main
+
+    import (
+        "context"
+        "fmt"
+
+        "github.com/cloudwego/eino/components/embedding"
+        "github.com/cloudwego/eino-ext/components/embedding/openai"
+    )
+
+    func main() {
+        ctx := context.Background()
+
+        emb, err := openai.NewEmbedder(ctx, &openai.EmbeddingConfig{
+            Model: "text-embedding-3-small",
+        })
+        if err != nil {
+            panic(err)
+        }
+
+        texts := []string{
+            "Eino is a Go LLM framework.",
+            "CloudWeGo builds high-performance Go frameworks.",
+        }
+
+        vectors, err := emb.EmbedStrings(ctx, texts,
+            embedding.WithModel("text-embedding-3-small"),
+        )
+        if err != nil {
+            panic(err)
+        }
+
+        for i, v := range vectors {
+            fmt.Printf("text[%d] → %d-dim vector\n", i, len(v))
+        }
+    }
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Implementing a custom embedder
+
+```go
+package myembedder
+
+import (
+    "context"
+
+    "github.com/cloudwego/eino/components/embedding"
+)
+
+type MyEmbedder struct {
+    defaultModel string
+    client       MyHTTPClient
+}
+
+func (e *MyEmbedder) EmbedStrings(ctx context.Context, texts []string, opts ...embedding.Option) ([][]float64, error) {
+    options := embedding.GetCommonOptions(&embedding.Options{Model: &e.defaultModel}, opts...)
+
+    model := e.defaultModel
+    if options.Model != nil {
+        model = *options.Model
+    }
+
+    return e.client.Embed(ctx, model, texts)
+}
+```

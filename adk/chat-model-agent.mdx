@@ -1,0 +1,236 @@
+---
+title: "ChatModelAgent: build AI agents with tool use"
+description: "Learn how to build AI agents with the ChatModelAgent, which implements a ReAct loop where the model decides when to call tools versus respond."
+---
+
+`ChatModelAgent` is the foundational agent type in Eino's ADK. It wraps a chat model and a set of tools in a ReAct (Reason + Act) loop: the model receives the conversation history, decides whether to call one or more tools or produce a final answer, and the loop continues until the model responds directly or a stopping condition is met. You interact with the agent through a `Runner`, which streams events back to you as they occur.
+
+## Creating a ChatModelAgent
+
+Use `adk.NewChatModelAgent` with a `ChatModelAgentConfig`. The only required field is `Model`; all other fields are optional.
+
+```go
+import (
+    "context"
+
+    "github.com/cloudwego/eino/adk"
+    "github.com/cloudwego/eino/compose"
+    "github.com/cloudwego/eino/components/tool"
+)
+
+agent, err := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
+    // Name and Description are required when using the agent as a sub-agent tool.
+    Name:        "assistant",
+    Description: "A general-purpose assistant agent.",
+
+    // Instruction becomes the system prompt. Supports f-string placeholders
+    // when session values are present, e.g. "Current user: {User}".
+    Instruction: "You are a helpful assistant.",
+
+    // Model is required. Must support model.WithTools if you configure any tools.
+    Model: chatModel,
+
+    // ToolsConfig specifies the tools available to the agent.
+    ToolsConfig: adk.ToolsConfig{
+        ToolsNodeConfig: compose.ToolsNodeConfig{
+            Tools: []tool.BaseTool{weatherTool, calculatorTool},
+        },
+        // ReturnDirectly makes the agent return immediately when a named tool is called,
+        // without sending the tool result back to the model for a follow-up turn.
+        ReturnDirectly: map[string]bool{
+            "calculator": true,
+        },
+    },
+
+    // MaxIterations caps the ReAct loop. Defaults to 20.
+    MaxIterations: 10,
+})
+```
+
+### ChatModelAgentConfig fields
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `Name` | `string` | No† | Agent identifier. Required when used as a sub-agent tool. |
+| `Description` | `string` | No† | Describes the agent's capabilities. Required when used as a sub-agent tool. |
+| `Instruction` | `string` | No | System prompt. Supports f-string placeholders with session values. |
+| `Model` | `model.BaseChatModel` | **Yes** | The chat model. Must support `model.WithTools` if tools are configured. |
+| `ToolsConfig` | `ToolsConfig` | No | Tools and tool-calling configuration. |
+| `GenModelInput` | `GenModelInput` | No | Custom function to transform instruction and messages into model input. |
+| `Exit` | `tool.BaseTool` | No | Tool that signals the agent to exit. Use `adk.ExitTool{}` for the built-in implementation. |
+| `OutputKey` | `string` | No | Session key under which the agent's final response is stored. |
+| `MaxIterations` | `int` | No | Maximum ReAct loop iterations. Defaults to 20. |
+| `Middlewares` | `[]AgentMiddleware` | No | Struct-based hooks for simple additions (extra instructions or tools). |
+| `Handlers` | `[]ChatModelAgentMiddleware` | No | Interface-based handlers for dynamic behavior and context propagation. |
+| `ModelRetryConfig` | `*ModelRetryConfig` | No | Retry policy for failed model calls. |
+
+† `Name` and `Description` are optional for standalone use but required if you wrap the agent with `NewAgentTool`.
+
+## Running the agent with Runner
+
+`Runner` is the primary entry point for executing an agent. Create one with `adk.NewRunner`, then call `Query` for a single string input or `Run` for a slice of messages.
+
+```go
+runner := adk.NewRunner(ctx, adk.RunnerConfig{
+    Agent:          agent,
+    EnableStreaming: true, // stream model output token-by-token
+})
+
+iter := runner.Query(ctx, "What is the weather in Paris?")
+```
+
+### Consuming events
+
+Both `Query` and `Run` return an `*AsyncIterator[*AgentEvent]`. Call `iter.Next()` in a loop until it returns `false`.
+
+```go
+for {
+    event, ok := iter.Next()
+    if !ok {
+        break
+    }
+
+    if event.Err != nil {
+        log.Printf("error: %v", event.Err)
+        continue
+    }
+
+    if event.Action != nil && event.Action.Interrupted != nil {
+        // The agent paused for human input — see the human-in-the-loop guide.
+        handleInterrupt(event.Action.Interrupted)
+        continue
+    }
+
+    if event.Output != nil && event.Output.MessageOutput != nil {
+        msg, err := event.Output.MessageOutput.GetMessage()
+        if err != nil {
+            log.Printf("error reading message: %v", err)
+            continue
+        }
+        fmt.Printf("[%s] %s\n", event.AgentName, msg.Content)
+    }
+}
+```
+
+## AgentEvent structure
+
+Every value yielded by the iterator is an `*AgentEvent`:
+
+```go
+type AgentEvent struct {
+    // AgentName identifies which agent emitted this event.
+    AgentName string
+
+    // RunPath is the execution path from the root agent to the event source.
+    // Managed by the framework — do not set this yourself.
+    RunPath []RunStep
+
+    // Output carries the message or custom output produced by the agent.
+    Output *AgentOutput
+
+    // Action describes a control action: exit, interrupt, transfer, or break loop.
+    Action *AgentAction
+
+    // Err holds any error that occurred during the agent's execution.
+    Err error
+}
+```
+
+`AgentOutput.MessageOutput` is a `*MessageVariant`. Call `GetMessage()` to obtain the concrete `*schema.Message` regardless of whether the output is streaming or non-streaming:
+
+```go
+msg, err := event.Output.MessageOutput.GetMessage()
+if err == nil {
+    fmt.Println(msg.Content)
+}
+```
+
+`MessageVariant.Role` tells you whether the message is an assistant turn (`schema.Assistant`) or a tool result (`schema.Tool`). When `Role` is `schema.Tool`, `MessageVariant.ToolName` contains the name of the tool that produced the result.
+
+## Streaming vs non-streaming
+
+When `EnableStreaming: true` is set on `RunnerConfig`, the agent calls `model.Stream` instead of `model.Generate` each turn, and `MessageVariant.IsStreaming` is `true`. You can consume the stream directly:
+
+```go
+if mv := event.Output.MessageOutput; mv.IsStreaming {
+    for {
+        chunk, err := mv.MessageStream.Recv()
+        if err == io.EOF {
+            break
+        }
+        fmt.Print(chunk.Content)
+    }
+} else {
+    fmt.Println(mv.Message.Content)
+}
+```
+
+<Note>
+Call `GetMessage()` if you just need the final concatenated message — it handles both streaming and non-streaming transparently.
+</Note>
+
+## The ReAct loop
+
+`ChatModelAgent` implements the ReAct pattern internally. Each iteration of the loop:
+
+<Steps>
+  <Step title="Prepare model input">
+    `GenModelInput` combines the system instruction and conversation history into a message slice for the model.
+  </Step>
+  <Step title="Call the model">
+    The model receives the messages and the tool schemas. It either generates a final response or emits one or more tool calls.
+  </Step>
+  <Step title="Execute tools (if called)">
+    Each requested tool runs, and the results are appended to the conversation history as tool messages.
+  </Step>
+  <Step title="Repeat or return">
+    If a tool is marked `ReturnDirectly`, the agent returns immediately. Otherwise the loop continues until the model produces a non-tool-call response or `MaxIterations` is reached.
+  </Step>
+</Steps>
+
+## Adding tools
+
+Pass tools through `ToolsConfig.ToolsNodeConfig.Tools`. Any value that implements `tool.BaseTool` works, including tools generated from Eino composition graphs.
+
+```go
+ToolsConfig: adk.ToolsConfig{
+    ToolsNodeConfig: compose.ToolsNodeConfig{
+        Tools: []tool.BaseTool{
+            weatherTool,
+            calculatorTool,
+            searchTool,
+        },
+        // Execute tools sequentially instead of in parallel.
+        ExecuteSequentially: true,
+    },
+    // Return as soon as "search" completes, without sending the result back to the model.
+    ReturnDirectly: map[string]bool{
+        "search": true,
+    },
+    // Forward nested agent events to the outer event stream.
+    EmitInternalEvents: true,
+},
+```
+
+## Built-in prompt language
+
+The ADK's internal system prompts (used by prebuilt patterns like DeepAgent) default to English. To switch to Chinese, call `adk.SetLanguage` once during initialization:
+
+```go
+import "github.com/cloudwego/eino/adk"
+
+func init() {
+    adk.SetLanguage(adk.LanguageChinese)
+}
+```
+
+Available constants: `adk.LanguageEnglish` (default), `adk.LanguageChinese`.
+
+<CardGroup cols={2}>
+  <Card title="Multi-agent systems" href="/adk/multi-agent">
+    Wrap agents as tools and build coordinated multi-agent pipelines.
+  </Card>
+  <Card title="Human-in-the-loop" href="/adk/human-in-the-loop">
+    Pause execution for human review and resume from a checkpoint.
+  </Card>
+</CardGroup>

@@ -1,0 +1,372 @@
+---
+title: "ChatModel API reference"
+description: "Complete reference for BaseChatModel, ToolCallingChatModel, call-time Options, and callback input/output types in the Eino Go LLM framework."
+---
+
+The `model` package defines the interfaces and call-time options that all chat model implementations in Eino must satisfy. You interact with any backend — OpenAI, Ark, Qwen, or your own — through one of two interfaces: `BaseChatModel` for generation and streaming, and `ToolCallingChatModel` for safe, concurrent tool binding.
+
+## Interfaces
+
+### BaseChatModel
+
+`BaseChatModel` is the core interface every chat model implementation must satisfy. It exposes two generation modes: a blocking call that returns a complete message, and a streaming call that yields message chunks incrementally.
+
+```go
+type BaseChatModel interface {
+    Generate(ctx context.Context, input []*schema.Message, opts ...Option) (*schema.Message, error)
+    Stream(ctx context.Context, input []*schema.Message, opts ...Option) (
+        *schema.StreamReader[*schema.Message], error)
+}
+```
+
+#### Generate
+
+<ParamField path="ctx" type="context.Context" required>
+  Request context. Use it to carry deadlines, cancellation signals, and request-scoped values.
+</ParamField>
+
+<ParamField path="input" type="[]*schema.Message" required>
+  Conversation history as an ordered slice of messages. Each message carries a `Role` (`system`, `user`, `assistant`, or `tool`) and one or more content parts. Tool messages must include a `ToolCallID` that matches a prior assistant tool-call entry.
+</ParamField>
+
+<ParamField path="opts" type="...Option">
+  Zero or more call-time options. Standard options (temperature, max tokens, tools, etc.) are applied via the helper constructors below. Implementation-specific options are wrapped with `WrapImplSpecificOptFn`.
+</ParamField>
+
+<ResponseField name="*schema.Message" type="*schema.Message">
+  The complete assistant response. May contain `ToolCalls` when the model decides to invoke one or more tools.
+</ResponseField>
+
+<ResponseField name="error" type="error">
+  Non-nil on network errors, context cancellation, or backend API errors.
+</ResponseField>
+
+#### Stream
+
+`Stream` shares the same parameters as `Generate`. The difference is in the return type.
+
+<ResponseField name="*schema.StreamReader[*schema.Message]" type="*schema.StreamReader[*schema.Message]">
+  A reader that yields `*schema.Message` chunks as the model generates them. You must close the reader when you are done — call `defer reader.Close()` immediately after checking the error.
+
+  ```go
+  reader, err := m.Stream(ctx, messages)
+  if err != nil { /* handle */ }
+  defer reader.Close()
+
+  for {
+      chunk, err := reader.Recv()
+      if errors.Is(err, io.EOF) {
+          break
+      }
+      if err != nil { /* handle */ }
+      // process chunk
+  }
+  ```
+
+  A `StreamReader` can only be read once. Copy it before passing to multiple consumers.
+</ResponseField>
+
+<ResponseField name="error" type="error">
+  Non-nil when the stream cannot be established.
+</ResponseField>
+
+---
+
+### ToolCallingChatModel
+
+`ToolCallingChatModel` extends `BaseChatModel` with safe, immutable tool binding. Use this interface instead of the deprecated `ChatModel` in any concurrent or shared-instance scenario.
+
+```go
+type ToolCallingChatModel interface {
+    BaseChatModel
+    WithTools(tools []*schema.ToolInfo) (ToolCallingChatModel, error)
+}
+```
+
+#### WithTools
+
+<ParamField path="tools" type="[]*schema.ToolInfo" required>
+  Tool definitions to bind to the model. Each `ToolInfo` contains a name, description, and parameter JSON schema. Pass `nil` or an empty slice to produce an instance with no tools.
+</ParamField>
+
+<ResponseField name="ToolCallingChatModel" type="ToolCallingChatModel">
+  A new `ToolCallingChatModel` instance with the given tools attached. The original instance is unchanged.
+
+  ```go
+  base, _ := openai.NewChatModel(ctx, cfg)         // shared, no tools
+  withSearch, _ := base.WithTools([]*schema.ToolInfo{searchTool})
+  withCalc, _   := base.WithTools([]*schema.ToolInfo{calcTool})
+  // base, withSearch, and withCalc are independent — safe to use concurrently.
+  ```
+</ResponseField>
+
+<ResponseField name="error" type="error">
+  Non-nil if the tool definitions are invalid for this backend.
+</ResponseField>
+
+---
+
+### ChatModel (deprecated)
+
+<Warning>
+  `ChatModel` is deprecated. Use `ToolCallingChatModel` instead. `BindTools` mutates the receiver in place, creating a race condition when the same instance is called concurrently from multiple goroutines.
+</Warning>
+
+```go
+// Deprecated: Use ToolCallingChatModel instead.
+type ChatModel interface {
+    BaseChatModel
+    BindTools(tools []*schema.ToolInfo) error
+}
+```
+
+<ParamField path="tools" type="[]*schema.ToolInfo" required>
+  Tool definitions to bind. These overwrite any previously bound tools. Call `BindTools` before every request when tool sets change between calls.
+</ParamField>
+
+<ResponseField name="error" type="error">
+  Non-nil if the tool definitions are invalid.
+</ResponseField>
+
+---
+
+## Options
+
+Call-time options let you adjust model behaviour per request without reconfiguring the client. All standard options are defined in the `model` package.
+
+### Option constructors
+
+<ParamField path="WithTemperature(temperature float32)" type="Option">
+  Controls output randomness. Higher values (e.g. `1.0`) increase diversity; lower values (e.g. `0.0`) make output more deterministic.
+</ParamField>
+
+<ParamField path="WithMaxTokens(maxTokens int)" type="Option">
+  Caps the number of completion tokens. When the model reaches this limit it stops and returns a `finish_reason` of `"length"`.
+</ParamField>
+
+<ParamField path="WithModel(name string)" type="Option">
+  Overrides the model name for this call (e.g. `"gpt-4o"`, `"claude-3-5-sonnet"`).
+</ParamField>
+
+<ParamField path="WithTopP(topP float32)" type="Option">
+  Nucleus sampling threshold. The model considers only the top tokens whose cumulative probability exceeds `topP`.
+</ParamField>
+
+<ParamField path="WithStop(stop []string)" type="Option">
+  One or more stop sequences. The model halts generation when it produces any of the listed strings.
+</ParamField>
+
+<ParamField path="WithTools(tools []*schema.ToolInfo)" type="Option">
+  Attaches tool definitions for this call. Equivalent to calling `ToolCallingChatModel.WithTools` but scoped to a single request.
+</ParamField>
+
+<ParamField path="WithToolChoice(toolChoice schema.ToolChoice, allowedToolNames ...string)" type="Option">
+  Controls how the model selects tools. Pass optional `allowedToolNames` to restrict the model to a named subset of the bound tools.
+
+  | `schema.ToolChoice` value | Behaviour |
+  |---|---|
+  | `ToolChoiceForbidden` | Never call a tool; respond with plain text. |
+  | `ToolChoiceAllowed` | Decide autonomously whether to call a tool (default). |
+  | `ToolChoiceForced` | Always call at least one tool. |
+</ParamField>
+
+### Options struct
+
+`GetCommonOptions` merges a list of `Option` values onto an `Options` struct. Call it inside your own `Generate` / `Stream` implementation:
+
+```go
+type Options struct {
+    Temperature      *float32
+    MaxTokens        *int
+    Model            *string
+    TopP             *float32
+    Stop             []string
+    Tools            []*schema.ToolInfo
+    ToolChoice       *schema.ToolChoice
+    AllowedToolNames []string
+}
+```
+
+```go
+func (m *MyModel) Generate(ctx context.Context, input []*schema.Message, opts ...model.Option) (*schema.Message, error) {
+    options := model.GetCommonOptions(&model.Options{Temperature: &m.defaultTemp}, opts...)
+    // use options.Temperature, options.Tools, options.ToolChoice, etc.
+}
+```
+
+### Implementation-specific options
+
+Use `WrapImplSpecificOptFn` to expose backend-specific parameters alongside the standard options:
+
+```go
+// In your implementation package:
+func WithMyParam(v string) model.Option {
+    return model.WrapImplSpecificOptFn(func(o *MyOptions) {
+        o.MyParam = v
+    })
+}
+
+// Caller mixes standard and custom options freely:
+m.Generate(ctx, msgs,
+    model.WithTemperature(0.7),
+    mypkg.WithMyParam("value"),
+)
+```
+
+Retrieve them inside your implementation with `GetImplSpecificOptions`:
+
+```go
+myOpts := model.GetImplSpecificOptions(&MyOptions{MyParam: "default"}, opts...)
+```
+
+---
+
+## Callback types
+
+Eino's callback system passes typed structs into your `OnStart` / `OnEnd` handlers. Use `ConvCallbackInput` and `ConvCallbackOutput` to convert the raw `callbacks.CallbackInput` / `callbacks.CallbackOutput` interfaces into the typed model structs.
+
+### CallbackInput
+
+```go
+type CallbackInput struct {
+    Messages   []*schema.Message
+    Tools      []*schema.ToolInfo
+    ToolChoice *schema.ToolChoice
+    Config     *Config
+    Extra      map[string]any
+}
+```
+
+<ResponseField name="Messages" type="[]*schema.Message">
+  The input messages sent to the model for this call.
+</ResponseField>
+
+<ResponseField name="Tools" type="[]*schema.ToolInfo">
+  Tool definitions available to the model at call time.
+</ResponseField>
+
+<ResponseField name="ToolChoice" type="*schema.ToolChoice">
+  The effective tool-choice policy for this call.
+</ResponseField>
+
+<ResponseField name="Config" type="*Config">
+  A snapshot of the model's active configuration (model name, temperature, max tokens, top-p, stop words).
+</ResponseField>
+
+<ResponseField name="Extra" type="map[string]any">
+  Implementation-specific metadata added by the backend.
+</ResponseField>
+
+### CallbackOutput
+
+```go
+type CallbackOutput struct {
+    Message    *schema.Message
+    Config     *Config
+    TokenUsage *TokenUsage
+    Extra      map[string]any
+}
+```
+
+<ResponseField name="Message" type="*schema.Message">
+  The message returned by the model.
+</ResponseField>
+
+<ResponseField name="Config" type="*Config">
+  The configuration snapshot used for this generation.
+</ResponseField>
+
+<ResponseField name="TokenUsage" type="*TokenUsage">
+  Token counts for the request.
+
+  <Expandable title="TokenUsage fields">
+    <ResponseField name="PromptTokens" type="int">Total input tokens, including cached tokens.</ResponseField>
+    <ResponseField name="CompletionTokens" type="int">Output tokens generated by the model.</ResponseField>
+    <ResponseField name="TotalTokens" type="int">Sum of prompt and completion tokens.</ResponseField>
+    <ResponseField name="PromptTokenDetails.CachedTokens" type="int">Prompt tokens served from the provider's cache.</ResponseField>
+    <ResponseField name="CompletionTokensDetails.ReasoningTokens" type="int">Tokens consumed by chain-of-thought reasoning (OpenAI, Gemini, ARK, Qwen only).</ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="Extra" type="map[string]any">
+  Implementation-specific metadata added by the backend.
+</ResponseField>
+
+---
+
+## Usage example
+
+```go
+package main
+
+import (
+    "context"
+    "errors"
+    "fmt"
+    "io"
+
+    "github.com/cloudwego/eino/components/model"
+    "github.com/cloudwego/eino/schema"
+    // replace with your chosen backend
+    "github.com/cloudwego/eino-ext/components/model/openai"
+)
+
+func main() {
+    ctx := context.Background()
+
+    // 1. Create a base model (shared across goroutines).
+    base, err := openai.NewChatModel(ctx, &openai.ChatModelConfig{
+        Model: "gpt-4o-mini",
+    })
+    if err != nil {
+        panic(err)
+    }
+
+    // 2. Derive a tool-bound variant without mutating base.
+    withTools, err := base.WithTools([]*schema.ToolInfo{
+        {
+            Name: "get_weather",
+            Desc: "Return current weather for a city.",
+            ParamsOneOf: schema.NewParamsOneOfByParams(map[string]*schema.ParameterInfo{
+                "city": {Type: schema.String, Desc: "City name", Required: true},
+            }),
+        },
+    })
+    if err != nil {
+        panic(err)
+    }
+
+    messages := []*schema.Message{
+        {Role: schema.System, Content: "You are a helpful assistant."},
+        {Role: schema.User, Content: "What is the weather in London?"},
+    }
+
+    // 3. Blocking generation.
+    msg, err := withTools.Generate(ctx, messages,
+        model.WithTemperature(0.7),
+        model.WithToolChoice(schema.ToolChoiceAllowed),
+    )
+    if err != nil {
+        panic(err)
+    }
+    fmt.Println(msg.Content)
+
+    // 4. Streaming generation.
+    reader, err := base.Stream(ctx, messages)
+    if err != nil {
+        panic(err)
+    }
+    defer reader.Close()
+
+    for {
+        chunk, err := reader.Recv()
+        if errors.Is(err, io.EOF) {
+            break
+        }
+        if err != nil {
+            panic(err)
+        }
+        fmt.Print(chunk.Content)
+    }
+}
+```

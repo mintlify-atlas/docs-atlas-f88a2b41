@@ -1,0 +1,51 @@
+---
+title: "Eino: Go Framework for LLM Applications"
+description: "Eino is a Go-native LLM application framework offering reusable components, a composable graph engine, and a full Agent Development Kit."
+---
+
+Eino is a Go-native framework for building LLM-powered applications. It draws from LangChain, Google ADK, and other open-source frameworks while following Go conventions throughout. Whether you want a quick agent that answers questions or a precisely controlled multi-step pipeline, Eino gives you the building blocks and the wiring to get there. Eino requires Go 1.18 or later.
+
+## Three layers of the framework
+
+Eino is organized into three complementary layers that you can use independently or together.
+
+### Components
+
+Components are typed interfaces for the primitives of LLM applications: `ChatModel`, `Tool`, `Retriever`, `Embedding`, `ChatTemplate`, and more. Official implementations for OpenAI, Claude, Gemini, Ark, Ollama, Elasticsearch, and others live in the [eino-ext](https://github.com/cloudwego/eino-ext) repository. You import only the implementations you need, keeping your binary lean.
+
+### Composition
+
+The `compose` package lets you wire components into graphs and workflows with typed edges. The framework automatically handles streaming throughout orchestration — concatenating, boxing, merging, and copying streams as data flows between nodes. Compositions can be exposed as tools for agents, bridging deterministic pipelines with autonomous behavior.
+
+### Agent Development Kit (ADK)
+
+The ADK provides ready-to-use agent patterns built on top of components and composition. `ChatModelAgent` implements the ReAct loop so you can give a model tools and let it decide when to call them. More advanced patterns like DeepAgent coordinate multiple specialized sub-agents for complex, multi-step tasks. The ADK also supports interrupt/resume for human-in-the-loop workflows and checkpoint-based state persistence.
+
+## Where to go next
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="bolt" href="/quickstart">
+    Build and run your first Eino agent in minutes.
+  </Card>
+  <Card title="Core concepts" icon="book-open" href="/concepts/overview">
+    Understand components, composition, and agents in depth.
+  </Card>
+  <Card title="ChatModelAgent" icon="robot" href="/adk/chat-model-agent">
+    Learn how the ReAct agent pattern works and how to configure it.
+  </Card>
+  <Card title="Graph composition" icon="diagram-project" href="/composition/graph">
+    Build precise, typed execution graphs with the compose package.
+  </Card>
+</CardGroup>
+
+## Ecosystem
+
+| Repository | Purpose |
+|---|---|
+| [cloudwego/eino](https://github.com/cloudwego/eino) | Core framework: types, streaming, composition, ADK |
+| [cloudwego/eino-ext](https://github.com/cloudwego/eino-ext) | Component implementations (OpenAI, Ollama, etc.), callback handlers, evaluators |
+| [cloudwego/eino-examples](https://github.com/cloudwego/eino-examples) | Working examples for common patterns and real-world use cases |
+
+<Note>
+  Eino follows Go module conventions. The core `eino` module defines abstractions; `eino-ext` provides implementations. You only import the implementations your project uses.
+</Note>

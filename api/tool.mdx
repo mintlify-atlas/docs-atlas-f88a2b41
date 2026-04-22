@@ -1,0 +1,328 @@
+---
+title: "Tool API reference: BaseTool and InvokableTool"
+description: "Complete reference for BaseTool, InvokableTool, StreamableTool, schema.ToolInfo, ParameterInfo, and Options in the Eino Go LLM framework."
+---
+
+The `tool` package defines the interfaces that let a chat model discover and execute tools. `BaseTool` supplies the metadata a model needs to generate tool calls. `InvokableTool` adds execution so the `ToolsNode` can run the tool and return a result. Enhanced variants (`EnhancedInvokableTool`, `EnhancedStreamableTool`) support structured multimodal output.
+
+## Interfaces
+
+### BaseTool
+
+`BaseTool` exposes the metadata — name, description, and parameter schema — that a `ChatModel` uses to decide whether and how to call a tool. You only need `BaseTool` when passing tool definitions to a model; implement `InvokableTool` (or its streaming / enhanced counterparts) to also execute the tool.
+
+```go
+type BaseTool interface {
+    Info(ctx context.Context) (*schema.ToolInfo, error)
+}
+```
+
+<ParamField path="ctx" type="context.Context" required>
+  Request context. Carry deadlines or cancellation signals if constructing tool info is an asynchronous or remote operation.
+</ParamField>
+
+<ResponseField name="*schema.ToolInfo" type="*schema.ToolInfo">
+  The tool descriptor consumed by the model. See [schema.ToolInfo](#schematoolinfo) below.
+</ResponseField>
+
+<ResponseField name="error" type="error">
+  Non-nil when the tool info cannot be constructed (e.g. a remote schema fetch fails).
+</ResponseField>
+
+---
+
+### InvokableTool
+
+`InvokableTool` extends `BaseTool` with `InvokableRun`, which `ToolsNode` calls when a model requests a tool execution. The framework passes the model's raw JSON arguments and expects a plain string result that is returned to the model as a tool message.
+
+```go
+type InvokableTool interface {
+    BaseTool
+    InvokableRun(ctx context.Context, argumentsInJSON string, opts ...Option) (string, error)
+}
+```
+
+<ParamField path="ctx" type="context.Context" required>
+  Request context.
+</ParamField>
+
+<ParamField path="argumentsInJSON" type="string" required>
+  The model's tool-call arguments serialised as a JSON object string. When you use `utils.InferTool` or `utils.NewTool`, the framework handles JSON decoding for you before calling your implementation function.
+</ParamField>
+
+<ParamField path="opts" type="...Option">
+  Implementation-specific call-time options. Unwrap them inside your method with `tool.GetImplSpecificOptions`.
+</ParamField>
+
+<ResponseField name="string" type="string">
+  The tool result returned to the model as a tool-role message. Keep responses concise — verbosity increases token usage for all subsequent turns.
+</ResponseField>
+
+<ResponseField name="error" type="error">
+  Non-nil on execution failure. The framework surfaces the error to the graph rather than sending it to the model.
+</ResponseField>
+
+---
+
+### StreamableTool
+
+`StreamableTool` is the streaming variant of `InvokableTool`. Use it when your tool produces output incrementally (e.g. a code executor that streams stdout).
+
+```go
+type StreamableTool interface {
+    BaseTool
+    StreamableRun(ctx context.Context, argumentsInJSON string, opts ...Option) (*schema.StreamReader[string], error)
+}
+```
+
+<ResponseField name="*schema.StreamReader[string]" type="*schema.StreamReader[string]">
+  A reader that yields string chunks. The caller (`ToolsNode`) is responsible for closing the reader.
+</ResponseField>
+
+---
+
+### EnhancedInvokableTool
+
+`EnhancedInvokableTool` accepts structured arguments and returns a multimodal `*schema.ToolResult` instead of a plain string. When a tool implements both a standard and an enhanced interface, `ToolsNode` prioritises the enhanced one.
+
+```go
+type EnhancedInvokableTool interface {
+    BaseTool
+    InvokableRun(ctx context.Context, toolArgument *schema.ToolArgument, opts ...Option) (*schema.ToolResult, error)
+}
+```
+
+---
+
+### EnhancedStreamableTool
+
+`EnhancedStreamableTool` is the streaming counterpart to `EnhancedInvokableTool`.
+
+```go
+type EnhancedStreamableTool interface {
+    BaseTool
+    StreamableRun(ctx context.Context, toolArgument *schema.ToolArgument, opts ...Option) (*schema.StreamReader[*schema.ToolResult], error)
+}
+```
+
+---
+
+## schema.ToolInfo
+
+`ToolInfo` is the descriptor you return from `BaseTool.Info`. It carries the name, description, and parameter schema that the model uses to generate tool-call arguments.
+
+```go
+type ToolInfo struct {
+    Name        string
+    Desc        string
+    Extra       map[string]any
+    *ParamsOneOf
+}
+```
+
+<ResponseField name="Name" type="string" required>
+  A concise, unique identifier for the tool within the tool set. The model references this name in tool-call responses.
+</ResponseField>
+
+<ResponseField name="Desc" type="string" required>
+  A plain-language explanation of when and why to use the tool. Including a few-shot example in the description significantly improves model accuracy.
+</ResponseField>
+
+<ResponseField name="Extra" type="map[string]any">
+  Open map for attaching implementation-specific metadata. Not sent to the model.
+</ResponseField>
+
+<ResponseField name="*ParamsOneOf" type="*ParamsOneOf">
+  The parameter schema. Set this to `nil` for tools that accept no arguments. Construct it with one of two helpers:
+
+  | Constructor | When to use |
+  |---|---|
+  | `schema.NewParamsOneOfByParams(map[string]*ParameterInfo)` | Most cases — scalars, arrays, nested objects, enums, required flags. |
+  | `schema.NewParamsOneOfByJSONSchema(*jsonschema.Schema)` | When you need `anyOf`, `oneOf`, `$defs`, or other JSON Schema 2020-12 features. `utils.InferTool` generates this form automatically from Go struct tags. |
+</ResponseField>
+
+---
+
+## schema.ParameterInfo
+
+`ParameterInfo` describes a single tool parameter when using `NewParamsOneOfByParams`.
+
+```go
+type ParameterInfo struct {
+    Type      DataType
+    ElemInfo  *ParameterInfo
+    SubParams map[string]*ParameterInfo
+    Desc      string
+    Enum      []string
+    Required  bool
+}
+```
+
+<ResponseField name="Type" type="DataType" required>
+  The JSON Schema data type. One of:
+
+  | Constant | JSON Schema type |
+  |---|---|
+  | `schema.Object` | `"object"` |
+  | `schema.Number` | `"number"` |
+  | `schema.Integer` | `"integer"` |
+  | `schema.String` | `"string"` |
+  | `schema.Array` | `"array"` |
+  | `schema.Boolean` | `"boolean"` |
+  | `schema.Null` | `"null"` |
+</ResponseField>
+
+<ResponseField name="ElemInfo" type="*ParameterInfo">
+  The element type descriptor for `Array` parameters.
+</ResponseField>
+
+<ResponseField name="SubParams" type="map[string]*ParameterInfo">
+  Child parameter descriptors for `Object` parameters.
+</ResponseField>
+
+<ResponseField name="Desc" type="string">
+  Human-readable description of what this parameter does. The model sees this text.
+</ResponseField>
+
+<ResponseField name="Enum" type="[]string">
+  Allowed string values. Only meaningful when `Type` is `schema.String`.
+</ResponseField>
+
+<ResponseField name="Required" type="bool">
+  When `true`, the model is instructed to always provide this argument.
+</ResponseField>
+
+---
+
+## Options
+
+Tool options are implementation-specific. The `tool` package provides no common option fields — you define your own options struct and expose constructors using `WrapImplSpecificOptFn`.
+
+```go
+// In your tool package:
+type myOptions struct {
+    timeout int
+}
+
+func WithTimeout(ms int) tool.Option {
+    return tool.WrapImplSpecificOptFn(func(o *myOptions) {
+        o.timeout = ms
+    })
+}
+
+// Inside InvokableRun:
+func (t *MyTool) InvokableRun(ctx context.Context, argumentsInJSON string, opts ...tool.Option) (string, error) {
+    options := tool.GetImplSpecificOptions(&myOptions{timeout: 5000}, opts...)
+    _ = options.timeout
+    // ...
+}
+```
+
+---
+
+## Implementing a custom tool
+
+The quickest path is `utils.InferTool`, which reflects on a Go function's input struct to produce the `ToolInfo` and argument decoder automatically:
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+
+    "github.com/cloudwego/eino/components/tool/utils"
+)
+
+type WeatherInput struct {
+    City    string `json:"city"    jsonschema:"description=City name,required"`
+    Country string `json:"country" jsonschema:"description=ISO 3166-1 alpha-2 country code"`
+}
+
+func getWeather(ctx context.Context, input *WeatherInput) (string, error) {
+    return fmt.Sprintf("Sunny, 22°C in %s, %s", input.City, input.Country), nil
+}
+
+func main() {
+    ctx := context.Background()
+
+    weatherTool, err := utils.InferTool("get_weather", "Return the current weather for a location.", getWeather)
+    if err != nil {
+        panic(err)
+    }
+
+    // weatherTool satisfies tool.InvokableTool
+    info, _ := weatherTool.Info(ctx)
+    fmt.Println(info.Name) // "get_weather"
+}
+```
+
+For full control, implement `BaseTool` and `InvokableTool` directly:
+
+```go
+package mytool
+
+import (
+    "context"
+    "encoding/json"
+
+    "github.com/cloudwego/eino/components/tool"
+    "github.com/cloudwego/eino/schema"
+)
+
+type calculatorArgs struct {
+    A float64 `json:"a"`
+    B float64 `json:"b"`
+}
+
+type Calculator struct{}
+
+func (c *Calculator) Info(_ context.Context) (*schema.ToolInfo, error) {
+    return &schema.ToolInfo{
+        Name: "calculator",
+        Desc: "Add two numbers and return the sum.",
+        ParamsOneOf: schema.NewParamsOneOfByParams(map[string]*schema.ParameterInfo{
+            "a": {Type: schema.Number, Desc: "First operand", Required: true},
+            "b": {Type: schema.Number, Desc: "Second operand", Required: true},
+        }),
+    }, nil
+}
+
+func (c *Calculator) InvokableRun(_ context.Context, argumentsInJSON string, _ ...tool.Option) (string, error) {
+    var args calculatorArgs
+    if err := json.Unmarshal([]byte(argumentsInJSON), &args); err != nil {
+        return "", err
+    }
+    return fmt.Sprintf("%g", args.A+args.B), nil
+}
+```
+
+---
+
+## Using tools in a graph
+
+Pass your `InvokableTool` implementations to `ToolsNode` via `ToolsNodeConfig`:
+
+```go
+import (
+    "github.com/cloudwego/eino/compose"
+    "github.com/cloudwego/eino/components/tool"
+)
+
+calculator := &mytool.Calculator{}
+
+graph := compose.NewGraph[map[string]any, *schema.Message]()
+graph.AddToolsNode("tools", &compose.ToolsNodeConfig{
+    Tools: []tool.BaseTool{calculator},
+})
+```
+
+Retrieve tool infos to pass to `WithTools` on the model:
+
+```go
+ctx := context.Background()
+info, err := calculator.Info(ctx)
+if err != nil { /* handle */ }
+
+modelWithTools, err := chatModel.WithTools([]*schema.ToolInfo{info})
+```

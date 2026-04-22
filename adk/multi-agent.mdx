@@ -1,0 +1,174 @@
+---
+title: "Multi-agent systems with agent coordination"
+description: "Coordinate multiple specialized agents using agent tools, transfer actions, and scoped boundaries to build complex multi-agent pipelines in Eino."
+---
+
+Multi-agent systems let you decompose complex tasks across specialized agents that each have their own model, tools, and instructions. Eino provides a first-class mechanism for this: any agent can be wrapped as a tool that another agent can invoke. The wrapping agent treats the sub-agent like any other tool — it calls it with a request and receives a text response — while the framework manages execution boundaries, event forwarding, and interrupt propagation between them.
+
+## Wrapping an agent as a tool
+
+Use `adk.NewAgentTool` to turn any `Agent` into a `tool.BaseTool`. The tool's name and description come from the agent's `Name()` and `Description()` methods, so both must be non-empty.
+
+```go
+researchAgent, _ := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
+    Name:        "research_agent",
+    Description: "Searches the web and summarizes findings on a given topic.",
+    Model:       researchModel,
+    ToolsConfig: adk.ToolsConfig{
+        ToolsNodeConfig: compose.ToolsNodeConfig{
+            Tools: []tool.BaseTool{webSearchTool},
+        },
+    },
+})
+
+codeAgent, _ := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
+    Name:        "code_agent",
+    Description: "Writes and runs Python code to process data or perform calculations.",
+    Model:       codeModel,
+    ToolsConfig: adk.ToolsConfig{
+        ToolsNodeConfig: compose.ToolsNodeConfig{
+            Tools: []tool.BaseTool{pythonTool},
+        },
+    },
+})
+
+// Wrap each sub-agent as a tool.
+researchTool := adk.NewAgentTool(ctx, researchAgent)
+codeTool     := adk.NewAgentTool(ctx, codeAgent)
+
+// Give the orchestrator agent access to both sub-agents via tools.
+orchestrator, _ := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
+    Name:        "orchestrator",
+    Description: "Coordinates research and coding tasks.",
+    Model:       orchestratorModel,
+    ToolsConfig: adk.ToolsConfig{
+        ToolsNodeConfig: compose.ToolsNodeConfig{
+            Tools: []tool.BaseTool{researchTool, codeTool},
+        },
+        // Forward sub-agent events to the outer stream so the caller sees
+        // progress from inside each sub-agent in real time.
+        EmitInternalEvents: true,
+    },
+})
+```
+
+By default, the sub-agent receives a single `"request"` string extracted from the tool call arguments. Pass `adk.WithFullChatHistoryAsInput()` to `NewAgentTool` if you want the sub-agent to receive the parent's full conversation history instead.
+
+## Action scoping at agent tool boundaries
+
+When an agent is wrapped as a tool, any actions it emits during its run are scoped to the tool boundary. The table below summarizes what crosses the boundary and what does not:
+
+| Action | Behavior at boundary |
+|---|---|
+| `Interrupted` | Propagated upward via `CompositeInterrupt`, enabling interrupt/resume across nested agents. |
+| `Exit` | Ignored by the parent; only terminates the inner agent's loop. |
+| `TransferToAgent` | Ignored by the parent; only affects routing inside the inner agent. |
+| `BreakLoop` | Ignored by the parent; only breaks the inner agent's loop. |
+
+This scoping ensures a sub-agent cannot unexpectedly terminate or hijack the parent agent's execution flow.
+
+## Transfer between agents
+
+When an agent has sub-agents (either registered via `OnSubAgents` or provided through `SetSubAgents`), Eino automatically adds a `transfer_to_agent` tool to the agent's tool list. The model can call this tool to hand off the current task to a named sub-agent.
+
+```go
+// NewTransferToAgentAction is what the framework emits when transfer_to_agent is called.
+// You do not call this directly — the model triggers it through tool use.
+action := adk.NewTransferToAgentAction("research_agent")
+```
+
+After a transfer action, the orchestrator agent's loop ends and the target agent takes over. The target agent can later transfer back to its parent (unless `OnDisallowTransferToParent` has been called).
+
+## The OnSubAgents interface
+
+Agents that need to know about their sub-agents at initialization time implement `OnSubAgents`:
+
+```go
+type OnSubAgents interface {
+    // Called by the framework when sub-agents are registered.
+    OnSetSubAgents(ctx context.Context, subAgents []Agent) error
+
+    // Called when this agent is registered as a sub-agent of a parent.
+    OnSetAsSubAgent(ctx context.Context, parent Agent) error
+
+    // Called to prevent this agent from transferring back to its parent.
+    OnDisallowTransferToParent(ctx context.Context) error
+}
+```
+
+`ChatModelAgent` implements `OnSubAgents`. The framework calls these methods automatically when you use helpers like `adk.SetSubAgents`. You generally do not need to call them directly.
+
+## Registering sub-agents with SetSubAgents
+
+`adk.SetSubAgents` registers a list of agents as sub-agents of a parent and configures the transfer relationships bidirectionally:
+
+```go
+// After calling SetSubAgents, orchestrator gains a transfer_to_agent tool
+// pointing at researchAgent and codeAgent, and each sub-agent can transfer back.
+parent, err := adk.SetSubAgents(ctx, orchestrator, []adk.Agent{researchAgent, codeAgent})
+```
+
+## DeepAgent: delegation to sub-agents
+
+`deep.New` creates a ready-made orchestration agent that breaks down complex tasks into steps, delegates sub-tasks to specialized agents, and tracks progress. It adds built-in tools for task management and optionally for filesystem and shell access.
+
+```go
+import "github.com/cloudwego/eino/adk/prebuilt/deep"
+
+deepAgent, err := deep.New(ctx, &deep.Config{
+    ChatModel: chatModel,
+    SubAgents: []adk.Agent{researchAgent, codeAgent},
+    ToolsConfig: adk.ToolsConfig{
+        ToolsNodeConfig: compose.ToolsNodeConfig{
+            Tools: []tool.BaseTool{shellTool, webSearchTool},
+        },
+    },
+})
+
+runner := adk.NewRunner(ctx, adk.RunnerConfig{Agent: deepAgent})
+iter := runner.Query(ctx, "Analyze the sales data in report.csv and generate a summary chart")
+```
+
+<Note>
+`EmitInternalEvents: true` in the parent agent's `ToolsConfig` enables real-time event forwarding from sub-agents to the outer event stream. Without it, the parent only emits events for its own model and tool calls; sub-agent events are invisible to the caller.
+</Note>
+
+## Consuming events from a multi-agent system
+
+The `AgentEvent.RunPath` field contains the execution path from the root agent to the event source. Use it to trace which agent produced each event:
+
+```go
+iter := runner.Query(ctx, "Research quantum computing and write a summary script.")
+
+for {
+    event, ok := iter.Next()
+    if !ok {
+        break
+    }
+    if event.Err != nil {
+        log.Printf("error: %v", event.Err)
+        continue
+    }
+
+    // Print the agent path and message content.
+    path := make([]string, len(event.RunPath))
+    for i, step := range event.RunPath {
+        path[i] = step.String()
+    }
+    log.Printf("agent path: %v", path)
+
+    if event.Output != nil && event.Output.MessageOutput != nil {
+        msg, _ := event.Output.MessageOutput.GetMessage()
+        fmt.Printf("[%s] %s\n", event.AgentName, msg.Content)
+    }
+}
+```
+
+<CardGroup cols={2}>
+  <Card title="Prebuilt patterns" href="/adk/prebuilt-patterns">
+    Use DeepAgent, Supervisor, or Plan-Execute for ready-made multi-agent topologies.
+  </Card>
+  <Card title="Human-in-the-loop" href="/adk/human-in-the-loop">
+    Interrupt and resume execution across nested agent boundaries.
+  </Card>
+</CardGroup>

@@ -1,0 +1,256 @@
+---
+title: "Callbacks: logging, tracing, and metrics"
+description: "Attach lifecycle hooks to every Eino component invocation for logging, distributed tracing, metrics collection, and other cross-cutting concerns."
+---
+
+Eino's callback system gives you a consistent way to observe every component invocation — chat models, retrievers, tools, lambdas, and graphs alike — without modifying component code. You register handlers that fire at defined lifecycle moments (start, end, error, and their streaming equivalents), inspect the inputs and outputs, and return an updated context that the framework threads through subsequent timings of the same handler.
+
+## The Handler interface
+
+Every callback handler implements the `Handler` interface, which has five methods corresponding to the five callback timings:
+
+```go
+type Handler interface {
+    OnStart(ctx context.Context, info *RunInfo, input CallbackInput) context.Context
+    OnEnd(ctx context.Context, info *RunInfo, output CallbackOutput) context.Context
+    OnError(ctx context.Context, info *RunInfo, err error) context.Context
+    OnStartWithStreamInput(ctx context.Context, info *RunInfo, input *schema.StreamReader[CallbackInput]) context.Context
+    OnEndWithStreamOutput(ctx context.Context, info *RunInfo, output *schema.StreamReader[CallbackOutput]) context.Context
+}
+```
+
+Each method receives the `context.Context` returned by the *previous timing of the same handler*, so you can propagate state (for example, a start timestamp or a trace span) from `OnStart` into `OnEnd` via `context.WithValue`. There is **no guaranteed execution order between different handlers**, and the context chain does not flow from one handler to another.
+
+## Callback timings
+
+Five `CallbackTiming` constants identify when a handler is called:
+
+| Constant | When it fires |
+|---|---|
+| `TimingOnStart` | Just before the component begins processing a non-streaming input |
+| `TimingOnEnd` | After the component returns a successful non-streaming result |
+| `TimingOnError` | When the component returns a non-nil error (not for mid-stream errors) |
+| `TimingOnStartWithStreamInput` | When the component receives a streaming input (`Collect`/`Transform` paradigms) |
+| `TimingOnEndWithStreamOutput` | After the component returns a streaming output (`Stream`/`Transform` paradigms) |
+
+<Note>
+`TimingOnError` does not fire for errors that occur mid-stream. Those surface as errors inside the `StreamReader.Recv` call.
+</Note>
+
+## TimingChecker: skipping unused timings
+
+Implement the optional `TimingChecker` interface on your handler to tell the framework which timings you actually use. For timings where `Needed` returns `false`, Eino skips the overhead of copying streams and allocating goroutines:
+
+```go
+type TimingChecker interface {
+    Needed(ctx context.Context, info *RunInfo, timing CallbackTiming) bool
+}
+```
+
+Handlers built with `NewHandlerBuilder` implement `TimingChecker` automatically based on which callback functions you register.
+
+## RunInfo: identifying the caller
+
+Every handler method receives a `*RunInfo` that describes the component that triggered the callback:
+
+```go
+type RunInfo struct {
+    Name      string               // business name (e.g. the graph node name)
+    Type      string               // implementation identity, e.g. "OpenAI"
+    Component components.Component // category, e.g. components.ComponentOfChatModel
+}
+```
+
+- **`Name`** — the user-assigned name. For graph nodes this is set by `compose.WithNodeName`. For standalone components you set it via `callbacks.InitCallbacks` or `callbacks.ReuseHandlers`. It is an empty string if not explicitly set.
+- **`Type`** — the implementation identifier, derived from the `components.Typer` interface or by reflection. It is empty for a `Graph` itself.
+- **`Component`** — a category constant. Use this to branch on component kind without caring about which specific implementation is running.
+
+Always nil-check `RunInfo` before dereferencing it. A component that does not call `EnsureRunInfo` or `InitCallbacks` can leave `RunInfo` absent from the context.
+
+## Casting inputs and outputs to concrete types
+
+`CallbackInput` and `CallbackOutput` are untyped aliases. Each component package provides a safe conversion helper. These helpers return `nil` when the value does not match, so you can safely ignore invocations from components you are not interested in:
+
+```go
+import (
+    "github.com/cloudwego/eino/components/model"
+    "github.com/cloudwego/eino/callbacks"
+)
+
+handler := callbacks.NewHandlerBuilder().
+    OnStartFn(func(ctx context.Context, info *callbacks.RunInfo, input callbacks.CallbackInput) context.Context {
+        mi := model.ConvCallbackInput(input)
+        if mi == nil {
+            return ctx // not a chat model invocation — skip
+        }
+        log.Printf("[%s] model start: %d messages", info.Name, len(mi.Messages))
+        return ctx
+    }).
+    OnEndFn(func(ctx context.Context, info *callbacks.RunInfo, output callbacks.CallbackOutput) context.Context {
+        mo := model.ConvCallbackOutput(output)
+        if mo == nil {
+            return ctx
+        }
+        if mo.Message.ResponseMeta != nil {
+            log.Printf("[%s] tokens used: %d", info.Name, mo.Message.ResponseMeta.Usage.TotalTokens)
+        }
+        return ctx
+    }).
+    Build()
+```
+
+## Building a handler with NewHandlerBuilder
+
+`NewHandlerBuilder` lets you register only the timings you care about. The result automatically implements `TimingChecker` and returns `false` for any timing whose function you did not set:
+
+```go
+handler := callbacks.NewHandlerBuilder().
+    OnStartFn(func(ctx context.Context, info *callbacks.RunInfo, input callbacks.CallbackInput) context.Context {
+        // called before every non-streaming component invocation
+        return ctx
+    }).
+    OnEndFn(func(ctx context.Context, info *callbacks.RunInfo, output callbacks.CallbackOutput) context.Context {
+        // called after every successful non-streaming result
+        return ctx
+    }).
+    OnErrorFn(func(ctx context.Context, info *callbacks.RunInfo, err error) context.Context {
+        log.Printf("[%s] error: %v", info.Name, err)
+        return ctx
+    }).
+    Build()
+```
+
+You can also set `OnStartWithStreamInputFn` and `OnEndWithStreamOutputFn` for streaming component types.
+
+## Registering global handlers
+
+Use `AppendGlobalHandlers` to install handlers that observe **every** component invocation across the entire process — useful for distributed tracing and metrics:
+
+```go
+func main() {
+    callbacks.AppendGlobalHandlers(newTracingHandler(), newMetricsHandler())
+    // ... start your application
+}
+```
+
+<Warning>
+`AppendGlobalHandlers` is **not thread-safe**. Call it once during program initialization (e.g. in `main` or `TestMain`), before any graph executions begin. Calling it concurrently with ongoing graph executions causes data races.
+
+`InitCallbackHandlers` is deprecated; use `AppendGlobalHandlers` instead.
+</Warning>
+
+Global handlers run before per-invocation handlers registered with `compose.WithCallbacks`, giving them higher priority.
+
+## Attaching callbacks per invocation
+
+Pass `compose.WithCallbacks` as a run-time option to scope handlers to a single graph invocation:
+
+```go
+output, err := runnable.Invoke(ctx, input, compose.WithCallbacks(handler))
+```
+
+You can also target a specific node inside a graph:
+
+```go
+output, err := runnable.Invoke(ctx, input,
+    compose.WithCallbacks(globalHandler),
+    compose.WithCallbacks(nodeSpecificHandler).DesignateNode("my-node"),
+)
+```
+
+## Handling streaming callbacks
+
+Stream handlers receive a `*schema.StreamReader` that is a **private copy** of the stream. You must close your copy after reading it. Failing to close any handler's copy prevents the underlying goroutine from being freed, causing a goroutine and memory leak for the entire pipeline.
+
+```go
+handler := callbacks.NewHandlerBuilder().
+    OnEndWithStreamOutputFn(func(
+        ctx context.Context,
+        info *callbacks.RunInfo,
+        output *schema.StreamReader[callbacks.CallbackOutput],
+    ) context.Context {
+        defer output.Close() // always close your copy
+
+        for {
+            chunk, err := output.Recv()
+            if errors.Is(err, io.EOF) {
+                break
+            }
+            if err != nil {
+                log.Printf("[%s] stream error: %v", info.Name, err)
+                break
+            }
+            mo := model.ConvCallbackOutput(chunk)
+            if mo != nil {
+                // accumulate streaming token usage, etc.
+            }
+        }
+        return ctx
+    }).
+    Build()
+```
+
+<Warning>
+Do **not** mutate the `Input` or `Output` values you receive in a callback. All downstream nodes and other handlers share the same pointer — there is no deep copy. Mutations cause data races in concurrent graph execution.
+</Warning>
+
+## Complete logging callback example
+
+The following handler logs the start and end of every chat model invocation, carrying a start timestamp from `OnStart` into `OnEnd` via the context:
+
+```go
+package main
+
+import (
+    "context"
+    "log"
+    "time"
+
+    "github.com/cloudwego/eino/callbacks"
+    "github.com/cloudwego/eino/components/model"
+)
+
+type startTimeKey struct{}
+
+var loggingHandler = callbacks.NewHandlerBuilder().
+    OnStartFn(func(ctx context.Context, info *callbacks.RunInfo, input callbacks.CallbackInput) context.Context {
+        mi := model.ConvCallbackInput(input)
+        if mi == nil {
+            return ctx
+        }
+        log.Printf("[%s/%s] generating with %d messages", info.Component, info.Name, len(mi.Messages))
+        return context.WithValue(ctx, startTimeKey{}, time.Now())
+    }).
+    OnEndFn(func(ctx context.Context, info *callbacks.RunInfo, output callbacks.CallbackOutput) context.Context {
+        mo := model.ConvCallbackOutput(output)
+        if mo == nil {
+            return ctx
+        }
+        elapsed := time.Since(ctx.Value(startTimeKey{}).(time.Time))
+        tokens := 0
+        if mo.Message.ResponseMeta != nil {
+            tokens = mo.Message.ResponseMeta.Usage.TotalTokens
+        }
+        log.Printf("[%s/%s] done in %s, %d tokens", info.Component, info.Name, elapsed, tokens)
+        return ctx
+    }).
+    OnErrorFn(func(ctx context.Context, info *callbacks.RunInfo, err error) context.Context {
+        log.Printf("[%s/%s] error: %v", info.Component, info.Name, err)
+        return ctx
+    }).
+    Build()
+
+func main() {
+    callbacks.AppendGlobalHandlers(loggingHandler)
+    // build and run your graph ...
+}
+```
+
+<CardGroup cols={2}>
+  <Card title="Checkpoints" href="/observability/checkpoints">
+    Persist graph state for interrupt and resume
+  </Card>
+  <Card title="Human-in-the-loop" href="/adk/human-in-the-loop">
+    Build graphs that pause for human approval
+  </Card>
+</CardGroup>

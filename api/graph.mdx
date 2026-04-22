@@ -1,0 +1,623 @@
+---
+title: "Graph API: nodes, edges, branches, and compilation"
+description: "Reference for Graph[I,O] — add typed nodes, wire data-flow edges, attach conditional branches, and compile to a Runnable ready for execution."
+---
+
+`Graph[I, O]` is the central orchestration primitive in Eino. You build a directed graph by adding typed nodes, connecting them with edges or conditional branches, and then calling `Compile` to produce a `Runnable[I, O]` that you can invoke, stream, collect, or transform. The graph enforces type compatibility between connected nodes at compile time, so mismatches surface before you run anything.
+
+## Constants
+
+```go
+const START = "start"
+const END   = "end"
+```
+
+<ResponseField name="START" type="string">
+  Reserved node key representing the graph entry point. Use it as the `startNode` argument when adding the first edge from the graph's input.
+</ResponseField>
+
+<ResponseField name="END" type="string">
+  Reserved node key representing the graph exit point. Use it as the `endNode` argument when adding the last edge to the graph's output.
+</ResponseField>
+
+---
+
+## NewGraph
+
+```go
+func NewGraph[I, O any](opts ...NewGraphOption) *Graph[I, O]
+```
+
+`NewGraph` creates an empty, mutable directed graph whose compiled product accepts values of type `I` and produces values of type `O`. Pass `NewGraphOption` values to configure per-run local state.
+
+### Parameters
+
+<ParamField path="opts" type="...NewGraphOption">
+  Zero or more options that configure graph-level behaviour, such as local state generation. See [NewGraphOption](#newgraphoption) below.
+</ParamField>
+
+### Example
+
+```go
+g := compose.NewGraph[string, string]()
+```
+
+---
+
+## NewGraphOption
+
+`NewGraphOption` is a functional option passed to `NewGraph`.
+
+### WithGenLocalState
+
+```go
+func WithGenLocalState[S any](gls GenLocalState[S]) NewGraphOption
+```
+
+Registers a factory function that creates a fresh value of type `S` for every graph invocation. Nodes can read and write this state via `WithStatePreHandler` and `WithStatePostHandler`.
+
+<ParamField path="gls" type="GenLocalState[S]">
+  A function `func(ctx context.Context) *S` that returns a new, zeroed state value each time the graph runs.
+</ParamField>
+
+```go
+type MyState struct {
+    History []*schema.Message
+}
+
+g := compose.NewGraph[string, string](
+    compose.WithGenLocalState(func(ctx context.Context) *MyState {
+        return &MyState{}
+    }),
+)
+```
+
+---
+
+## AddLambdaNode
+
+```go
+func (g *Graph[I, O]) AddLambdaNode(key string, node *Lambda, opts ...GraphAddNodeOpt) error
+```
+
+Adds a `*Lambda` node. Use the `InvokableLambda`, `StreamableLambda`, `CollectableLambda`, `TransformableLambda`, or `AnyLambda` constructors to create the `*Lambda` value.
+
+<ParamField path="key" type="string" required>
+  Unique node identifier within this graph. Must not be `"start"` or `"end"`.
+</ParamField>
+
+<ParamField path="node" type="*Lambda" required>
+  The lambda function wrapper. Must implement at least one of the four run paradigms.
+</ParamField>
+
+<ParamField path="opts" type="...GraphAddNodeOpt">
+  Optional per-node configuration. See [GraphAddNodeOpt](#graphaddnodeopt).
+</ParamField>
+
+---
+
+## AddChatModelNode
+
+```go
+func (g *Graph[I, O]) AddChatModelNode(key string, node model.BaseChatModel, opts ...GraphAddNodeOpt) error
+```
+
+Adds a node that wraps a `model.BaseChatModel` implementation (e.g. an OpenAI or Ark chat model). The node accepts `[]*schema.Message` and returns `*schema.Message`.
+
+<ParamField path="key" type="string" required>
+  Unique node identifier.
+</ParamField>
+
+<ParamField path="node" type="model.BaseChatModel" required>
+  Any value that satisfies the `model.BaseChatModel` interface.
+</ParamField>
+
+<ParamField path="opts" type="...GraphAddNodeOpt">
+  Optional per-node configuration.
+</ParamField>
+
+---
+
+## AddChatTemplateNode
+
+```go
+func (g *Graph[I, O]) AddChatTemplateNode(key string, node prompt.ChatTemplate, opts ...GraphAddNodeOpt) error
+```
+
+Adds a node that wraps a `prompt.ChatTemplate`. The node accepts `map[string]any` variable bags and returns `[]*schema.Message`.
+
+<ParamField path="key" type="string" required>
+  Unique node identifier.
+</ParamField>
+
+<ParamField path="node" type="prompt.ChatTemplate" required>
+  A chat template, typically created with `prompt.FromMessages`.
+</ParamField>
+
+<ParamField path="opts" type="...GraphAddNodeOpt">
+  Optional per-node configuration.
+</ParamField>
+
+---
+
+## AddToolsNode
+
+```go
+func (g *Graph[I, O]) AddToolsNode(key string, node *ToolsNode, opts ...GraphAddNodeOpt) error
+```
+
+Adds a node that routes tool-call messages to registered tools and returns their results.
+
+<ParamField path="key" type="string" required>
+  Unique node identifier.
+</ParamField>
+
+<ParamField path="node" type="*ToolsNode" required>
+  A `*ToolsNode` created with `tools.NewToolNode`.
+</ParamField>
+
+<ParamField path="opts" type="...GraphAddNodeOpt">
+  Optional per-node configuration.
+</ParamField>
+
+---
+
+## AddRetrieverNode
+
+```go
+func (g *Graph[I, O]) AddRetrieverNode(key string, node retriever.Retriever, opts ...GraphAddNodeOpt) error
+```
+
+Adds a node that wraps a `retriever.Retriever`. The node accepts a query string and returns `[]*schema.Document`.
+
+<ParamField path="key" type="string" required>
+  Unique node identifier.
+</ParamField>
+
+<ParamField path="node" type="retriever.Retriever" required>
+  Any value that satisfies `retriever.Retriever`.
+</ParamField>
+
+<ParamField path="opts" type="...GraphAddNodeOpt">
+  Optional per-node configuration.
+</ParamField>
+
+---
+
+## AddEmbeddingNode
+
+```go
+func (g *Graph[I, O]) AddEmbeddingNode(key string, node embedding.Embedder, opts ...GraphAddNodeOpt) error
+```
+
+Adds a node that wraps an `embedding.Embedder`. The node accepts `[]string` and returns `[][]float64`.
+
+<ParamField path="key" type="string" required>
+  Unique node identifier.
+</ParamField>
+
+<ParamField path="node" type="embedding.Embedder" required>
+  Any value that satisfies `embedding.Embedder`.
+</ParamField>
+
+<ParamField path="opts" type="...GraphAddNodeOpt">
+  Optional per-node configuration.
+</ParamField>
+
+---
+
+## AddIndexerNode
+
+```go
+func (g *Graph[I, O]) AddIndexerNode(key string, node indexer.Indexer, opts ...GraphAddNodeOpt) error
+```
+
+Adds a node that wraps an `indexer.Indexer`. The node accepts `[]*schema.Document` and returns `[]string` (the stored document IDs).
+
+<ParamField path="key" type="string" required>
+  Unique node identifier.
+</ParamField>
+
+<ParamField path="node" type="indexer.Indexer" required>
+  Any value that satisfies `indexer.Indexer`.
+</ParamField>
+
+<ParamField path="opts" type="...GraphAddNodeOpt">
+  Optional per-node configuration.
+</ParamField>
+
+---
+
+## AddDocumentTransformerNode
+
+```go
+func (g *Graph[I, O]) AddDocumentTransformerNode(key string, node document.Transformer, opts ...GraphAddNodeOpt) error
+```
+
+Adds a node that wraps a `document.Transformer` (e.g. a markdown splitter). The node accepts and returns `[]*schema.Document`.
+
+<ParamField path="key" type="string" required>
+  Unique node identifier.
+</ParamField>
+
+<ParamField path="node" type="document.Transformer" required>
+  Any value that satisfies `document.Transformer`.
+</ParamField>
+
+<ParamField path="opts" type="...GraphAddNodeOpt">
+  Optional per-node configuration.
+</ParamField>
+
+---
+
+## AddLoaderNode
+
+```go
+func (g *Graph[I, O]) AddLoaderNode(key string, node document.Loader, opts ...GraphAddNodeOpt) error
+```
+
+Adds a node that wraps a `document.Loader`. The node typically accepts a source reference and returns `[]*schema.Document`.
+
+<ParamField path="key" type="string" required>
+  Unique node identifier.
+</ParamField>
+
+<ParamField path="node" type="document.Loader" required>
+  Any value that satisfies `document.Loader`.
+</ParamField>
+
+<ParamField path="opts" type="...GraphAddNodeOpt">
+  Optional per-node configuration.
+</ParamField>
+
+---
+
+## AddGraphNode
+
+```go
+func (g *Graph[I, O]) AddGraphNode(key string, node AnyGraph, opts ...GraphAddNodeOpt) error
+```
+
+Embeds another compiled graph, chain, or state-chain as a single node. The nested graph is compiled lazily when the outer graph is compiled.
+
+<ParamField path="key" type="string" required>
+  Unique node identifier.
+</ParamField>
+
+<ParamField path="node" type="AnyGraph" required>
+  A `*Graph[I, O]`, `*Chain[I, O]`, or similar value that satisfies `AnyGraph`.
+</ParamField>
+
+<ParamField path="opts" type="...GraphAddNodeOpt">
+  Optional per-node configuration. Use `WithGraphCompileOptions` to forward compile options to the nested graph.
+</ParamField>
+
+---
+
+## AddPassthroughNode
+
+```go
+func (g *Graph[I, O]) AddPassthroughNode(key string, opts ...GraphAddNodeOpt) error
+```
+
+Adds a node that forwards its input unchanged. Passthrough nodes are useful in Pregel-mode graphs for fan-in convergence points.
+
+<ParamField path="key" type="string" required>
+  Unique node identifier.
+</ParamField>
+
+<ParamField path="opts" type="...GraphAddNodeOpt">
+  Optional per-node configuration.
+</ParamField>
+
+---
+
+## AddEdge
+
+```go
+func (g *Graph[I, O]) AddEdge(startNode, endNode string) error
+```
+
+Connects two nodes with a directed data-flow edge. The output type of `startNode` must be assignable to the input type of `endNode`; the mismatch is detected at compile time.
+
+<Note>
+  Both nodes must have been added to the graph before you add an edge between them. `START` is a valid `startNode` and `END` is a valid `endNode`.
+</Note>
+
+<ParamField path="startNode" type="string" required>
+  Key of the source node, or `compose.START`.
+</ParamField>
+
+<ParamField path="endNode" type="string" required>
+  Key of the destination node, or `compose.END`.
+</ParamField>
+
+```go
+if err := g.AddEdge(compose.START, "retriever"); err != nil {
+    return err
+}
+if err := g.AddEdge("retriever", compose.END); err != nil {
+    return err
+}
+```
+
+---
+
+## AddBranch
+
+```go
+func (g *Graph[I, O]) AddBranch(startNode string, branch *GraphBranch) error
+```
+
+Attaches a conditional branch to `startNode`. At runtime the branch's condition function inspects the node's output and returns the key of the next node to execute. Only nodes listed in the branch's `endNodes` map are valid targets.
+
+<ParamField path="startNode" type="string" required>
+  Key of the node whose output the condition function receives.
+</ParamField>
+
+<ParamField path="branch" type="*GraphBranch" required>
+  Created with `NewGraphBranch`, `NewGraphMultiBranch`, or their streaming equivalents.
+</ParamField>
+
+### NewGraphBranch
+
+```go
+func NewGraphBranch[T any](condition GraphBranchCondition[T], endNodes map[string]bool) *GraphBranch
+```
+
+Creates a single-target branch. The condition returns the key of exactly one `endNode`.
+
+```go
+condition := func(ctx context.Context, msg *schema.Message) (string, error) {
+    if len(msg.ToolCalls) > 0 {
+        return "tools", nil
+    }
+    return compose.END, nil
+}
+
+branch := compose.NewGraphBranch(condition, map[string]bool{
+    "tools":     true,
+    compose.END: true,
+})
+
+g.AddBranch("chat_model", branch)
+```
+
+### NewGraphMultiBranch
+
+```go
+func NewGraphMultiBranch[T any](condition GraphMultiBranchCondition[T], endNodes map[string]bool) *GraphBranch
+```
+
+Creates a multi-target branch. The condition returns a `map[string]bool` of node keys to activate simultaneously.
+
+---
+
+## Compile
+
+```go
+func (g *Graph[I, O]) Compile(ctx context.Context, opts ...GraphCompileOption) (Runnable[I, O], error)
+```
+
+Validates the graph structure, infers types for all edges, compiles nested sub-graphs, and returns a `Runnable[I, O]` ready for execution. A graph can only be compiled once; calling any `Add*` method after compilation returns `ErrGraphCompiled`.
+
+<ParamField path="ctx" type="context.Context" required>
+  Context passed to nested graph compilation.
+</ParamField>
+
+<ParamField path="opts" type="...GraphCompileOption">
+  Optional compile-time configuration. See [GraphCompileOption](#graphcompileoption) below.
+</ParamField>
+
+```go
+runnable, err := g.Compile(ctx,
+    compose.WithGraphName("my_agent"),
+    compose.WithMaxRunSteps(50),
+)
+if err != nil {
+    return err
+}
+```
+
+---
+
+## GraphCompileOption
+
+`GraphCompileOption` is a functional option passed to `Compile`.
+
+### WithGraphName
+
+```go
+func WithGraphName(graphName string) GraphCompileOption
+```
+
+Sets a human-readable name used in logs, traces, and callbacks.
+
+<ParamField path="graphName" type="string" required>
+  An arbitrary identifier for this graph, e.g. `"rag_pipeline"`.
+</ParamField>
+
+---
+
+### WithMaxRunSteps
+
+```go
+func WithMaxRunSteps(maxSteps int) GraphCompileOption
+```
+
+Caps the total number of node executions per invocation. Prevents infinite loops in cyclic graphs by returning an error when the limit is reached.
+
+<ParamField path="maxSteps" type="int" required>
+  Maximum step count. A value of `0` means no limit.
+</ParamField>
+
+---
+
+### WithNodeTriggerMode
+
+```go
+func WithNodeTriggerMode(triggerMode NodeTriggerMode) GraphCompileOption
+```
+
+Controls when a node becomes eligible for execution.
+
+<ParamField path="triggerMode" type="NodeTriggerMode" required>
+  <Expandable title="values">
+    <ResponseField name="AnyPredecessor" type="NodeTriggerMode">
+      Default. A node runs as soon as **any** predecessor completes (Pregel mode). Supports cycles.
+    </ResponseField>
+    <ResponseField name="AllPredecessor" type="NodeTriggerMode">
+      A node runs only after **all** predecessors complete (DAG mode). Enables eager execution.
+    </ResponseField>
+  </Expandable>
+</ParamField>
+
+---
+
+### WithGraphCompileCallbacks
+
+```go
+func WithGraphCompileCallbacks(cbs ...GraphCompileCallback) GraphCompileOption
+```
+
+Registers callbacks that are notified at key points during graph compilation and execution.
+
+<ParamField path="cbs" type="...GraphCompileCallback">
+  One or more callback implementations.
+</ParamField>
+
+---
+
+### WithEagerExecutionDisabled
+
+```go
+func WithEagerExecutionDisabled() GraphCompileOption
+```
+
+Disables eager execution even when `AllPredecessor` trigger mode is active. With eager execution disabled, nodes wait for a complete super-step before running rather than starting as soon as their inputs are ready.
+
+---
+
+### WithFanInMergeConfig
+
+```go
+func WithFanInMergeConfig(confs map[string]FanInMergeConfig) GraphCompileOption
+```
+
+Configures per-node fan-in merge behaviour for nodes that receive data from multiple sources.
+
+<ParamField path="confs" type="map[string]FanInMergeConfig" required>
+  Map from node key to `FanInMergeConfig`. The `StreamMergeWithSourceEOF` field controls whether a `SourceEOF` sentinel is emitted when each upstream stream ends.
+</ParamField>
+
+---
+
+## GraphAddNodeOpt
+
+`GraphAddNodeOpt` is a functional option passed to any `Add*Node` method.
+
+### WithNodeName
+
+```go
+func WithNodeName(n string) GraphAddNodeOpt
+```
+
+Sets a display name for the node used in traces and callbacks. Defaults to the node key.
+
+<ParamField path="n" type="string" required>
+  Human-readable name, e.g. `"Chat model"`.
+</ParamField>
+
+---
+
+### WithInputKey
+
+```go
+func WithInputKey(k string) GraphAddNodeOpt
+```
+
+Extracts a single field from an upstream `map[string]any` output and passes its value as this node's input.
+
+<ParamField path="k" type="string" required>
+  Key to look up in the upstream map.
+</ParamField>
+
+---
+
+### WithOutputKey
+
+```go
+func WithOutputKey(k string) GraphAddNodeOpt
+```
+
+Wraps this node's output in a `map[string]any` under the given key before passing it downstream.
+
+<ParamField path="k" type="string" required>
+  Key under which the output is stored in the resulting map.
+</ParamField>
+
+---
+
+### WithGraphCompileOptions
+
+```go
+func WithGraphCompileOptions(opts ...GraphCompileOption) GraphAddNodeOpt
+```
+
+Forwards `GraphCompileOption` values to a nested graph node at the time of compilation.
+
+<ParamField path="opts" type="...GraphCompileOption">
+  Compile options to apply to the sub-graph.
+</ParamField>
+
+---
+
+### WithStatePreHandler
+
+```go
+func WithStatePreHandler[I, S any](pre StatePreHandler[I, S]) GraphAddNodeOpt
+```
+
+Registers a function that runs before this node executes. It receives the node's input of type `I` and the graph's shared state of type `S`, and returns a (possibly modified) input.
+
+<ParamField path="pre" type="StatePreHandler[I, S]" required>
+  A function `func(ctx context.Context, in I, state *S) (I, error)`. Requires the graph to be created with `WithGenLocalState`.
+</ParamField>
+
+---
+
+### WithStatePostHandler
+
+```go
+func WithStatePostHandler[O, S any](post StatePostHandler[O, S]) GraphAddNodeOpt
+```
+
+Registers a function that runs after this node executes. It receives the node's output of type `O` and the graph's shared state of type `S`, and returns a (possibly modified) output.
+
+<ParamField path="post" type="StatePostHandler[O, S]" required>
+  A function `func(ctx context.Context, out O, state *S) (O, error)`. Requires the graph to be created with `WithGenLocalState`.
+</ParamField>
+
+---
+
+### WithStreamStatePreHandler
+
+```go
+func WithStreamStatePreHandler[I, S any](pre StreamStatePreHandler[I, S]) GraphAddNodeOpt
+```
+
+Like `WithStatePreHandler`, but preserves the streaming nature of the input. Use this when the upstream node's output is a live stream and you want the input to remain a stream after the handler runs.
+
+<Warning>
+  Modifying shared state from within your own goroutine is not safe. The handler itself is invoked in a thread-safe manner, but any goroutines you spawn inside it are not.
+</Warning>
+
+---
+
+### WithStreamStatePostHandler
+
+```go
+func WithStreamStatePostHandler[O, S any](post StreamStatePostHandler[O, S]) GraphAddNodeOpt
+```
+
+Like `WithStatePostHandler`, but preserves the streaming nature of the output. Use this when this node produces a live stream and you want downstream nodes to receive it as a stream.

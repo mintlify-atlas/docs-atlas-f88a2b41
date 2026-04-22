@@ -1,0 +1,215 @@
+---
+title: "Declarative pipelines with compose.Workflow"
+description: "Use compose.Workflow to build acyclic pipelines by declaring field-level dependencies between nodes instead of managing explicit edges."
+---
+
+`compose.Workflow` is a higher-level wrapper around `Graph` that replaces explicit `AddEdge` calls with dependency declarations. Instead of wiring nodes together, each node declares which upstream nodes it depends on and — optionally — how to map specific fields from those outputs into its own input. Workflow always runs in `AllPredecessor` (DAG) mode with eager execution enabled, so it does not support cycles.
+
+Choose Workflow when your pipeline is acyclic and you want field-level mapping to be first-class rather than handled by Lambda adapters. Choose `compose.Graph` when you need cycles, fine-grained edge control, or Pregel-mode execution.
+
+## Creating a workflow
+
+`NewWorkflow[I, O]()` constructs an empty workflow typed by its overall input `I` and output `O`.
+
+```go
+import "github.com/cloudwego/eino/compose"
+
+wf := compose.NewWorkflow[*QueryInput, *QueryOutput]()
+```
+
+Like `Graph` and `Chain`, `NewWorkflow` accepts `NewGraphOption` values such as `WithGenLocalState`.
+
+## Adding nodes
+
+`Workflow` exposes the same `AddXXNode` methods as `Graph`, but each call returns a `*WorkflowNode` rather than an error. You chain dependency declarations directly off that returned node.
+
+```go
+retrieveNode := wf.AddRetrieverNode("retrieve", retriever)
+embedNode    := wf.AddEmbeddingNode("embed", embedder)
+llmNode      := wf.AddChatModelNode("llm", chatModel)
+```
+
+Available methods:
+
+| Method | Component type |
+|--------|---------------|
+| `AddChatModelNode` | `model.BaseChatModel` |
+| `AddChatTemplateNode` | `prompt.ChatTemplate` |
+| `AddToolsNode` | `*compose.ToolsNode` |
+| `AddRetrieverNode` | `retriever.Retriever` |
+| `AddEmbeddingNode` | `embedding.Embedder` |
+| `AddLoaderNode` | `document.Loader` |
+| `AddIndexerNode` | `indexer.Indexer` |
+| `AddDocumentTransformerNode` | `document.Transformer` |
+| `AddGraphNode` | `compose.AnyGraph` |
+| `AddLambdaNode` | `*compose.Lambda` |
+| `AddPassthroughNode` | — |
+
+## Declaring dependencies with AddInput
+
+`AddInput` tells the workflow that a node depends on another node and specifies how data flows between them.
+
+### Using the full output
+
+When the upstream node's output type matches the downstream node's input type exactly, pass just the upstream node key:
+
+```go
+// embed depends on retrieve; the full output of "retrieve" feeds into "embed"
+embedNode.AddInput("retrieve")
+```
+
+### Using field mappings
+
+When you need to project or rename fields, pass `*FieldMapping` values. Each mapping describes a source path and a destination path.
+
+```go
+llmNode.AddInput("retrieve",
+    compose.MapFields("documents", "context"),  // retrieve.documents → llm.context
+)
+llmNode.AddInput(compose.START,
+    compose.MapFields("query", "userQuery"),    // input.query → llm.userQuery
+)
+```
+
+### Execution-only dependency (no data)
+
+Use `AddDependency` when you need a node to wait for another to complete but no data passes between them:
+
+```go
+llmNode.AddDependency("embed")
+```
+
+### Cross-branch data access
+
+When nodes are on different sides of a branch, use `AddInputWithOptions` with `WithNoDirectDependency` to set up data mapping without creating a direct execution dependency (the branch itself controls execution order):
+
+```go
+mergeNode.AddInputWithOptions("branchA",
+    []*compose.FieldMapping{compose.MapFields("result", "resultA")},
+    compose.WithNoDirectDependency(),
+)
+```
+
+## Setting static values
+
+`SetStaticValue` injects a compile-time constant into a node's input without requiring an upstream node:
+
+```go
+llmNode.SetStaticValue(compose.FieldPath{"temperature"}, 0.7)
+```
+
+## Connecting to END
+
+Use `wf.End()` to obtain the `WorkflowNode` representing the graph's terminal node, then declare its inputs normally:
+
+```go
+wf.End().AddInput("llm")
+```
+
+## Adding branches
+
+`Workflow.AddBranch` accepts a `*GraphBranch` (created with `compose.NewGraphBranch`) and the key of the node it branches from. Each end node of the branch then declares its own inputs.
+
+```go
+branch := compose.NewGraphBranch(func(ctx context.Context, in *schema.Message) (string, error) {
+    if in.ToolCalls != nil {
+        return "tools", nil
+    }
+    return "respond", nil
+}, map[string]bool{"tools": true, "respond": true})
+
+wf.AddBranch("llm", branch)
+
+toolsNode.AddInput("llm")  // tools sees the llm output
+respondNode.AddInput("llm")
+```
+
+<Note>
+Unlike `Graph` branches, `Workflow` branches do **not** automatically pass the branching node's output to the selected end node. Each end node must declare its own inputs explicitly.
+</Note>
+
+## Full example
+
+```go
+type RAGInput struct {
+    Query string
+}
+
+type RAGOutput struct {
+    Answer string
+}
+
+wf := compose.NewWorkflow[*RAGInput, *RAGOutput]()
+
+embedNode  := wf.AddEmbeddingNode("embed", embedder)
+retNode    := wf.AddRetrieverNode("retrieve", retriever)
+promptNode := wf.AddChatTemplateNode("prompt", tmpl)
+llmNode    := wf.AddChatModelNode("llm", chatModel)
+formatNode := wf.AddLambdaNode("format", formatFn)
+
+// embed receives the raw query from START
+embedNode.AddInput(compose.START)
+
+// retrieve depends on embed output to perform vector search
+retNode.AddInput("embed")
+
+// prompt takes the query from START and documents from retrieve
+promptNode.
+    AddInput(compose.START, compose.MapFields("query", "userQuery")).
+    AddInput("retrieve", compose.MapFields("documents", "context"))
+
+// llm depends on the prompt node
+llmNode.AddInput("prompt")
+
+// format takes the llm response
+formatNode.AddInput("llm")
+
+// wire the final node to END
+wf.End().AddInput("format")
+
+runnable, err := wf.Compile(ctx, compose.WithGraphName("rag_workflow"))
+if err != nil { ... }
+
+output, err := runnable.Invoke(ctx, &RAGInput{Query: "What is Eino?"})
+```
+
+## Compiling a workflow
+
+`Compile` builds the workflow into a `Runnable[I, O]` with the same four execution methods available on any compiled graph or chain.
+
+```go
+runnable, err := wf.Compile(ctx, compose.WithGraphName("my_workflow"))
+if err != nil { ... }
+
+output, err := runnable.Invoke(ctx, input)
+stream, err  := runnable.Stream(ctx, input)
+```
+
+<Tip>
+Workflow automatically enables eager execution: nodes run as soon as all their declared inputs are available, without waiting for a full super-step to complete. You can disable this with `WithEagerExecutionDisabled()` if you need batched super-step semantics.
+</Tip>
+
+## Workflow vs Graph
+
+| | Workflow | Graph |
+|---|---|---|
+| Edge declaration | Implicit — nodes declare their own inputs | Explicit — `AddEdge` for every connection |
+| Field mapping | First-class via `AddInput` mappings | Requires Lambda adapters or separate `FieldMapping` |
+| Execution mode | DAG (`AllPredecessor`) with eager execution | Configurable: Pregel or DAG |
+| Cycles | Not supported | Supported in Pregel mode |
+| Best for | Acyclic pipelines with field-level data routing | Any topology, including loops |
+
+<CardGroup cols={2}>
+  <Card title="Graph" href="/composition/graph">
+    Explicit edges, cycles, and full topology control
+  </Card>
+  <Card title="Chain" href="/composition/chain">
+    Fluent builder for simple sequential pipelines
+  </Card>
+  <Card title="Streaming" href="/composition/streaming">
+    How streaming propagates through compiled graphs
+  </Card>
+  <Card title="Runnable API" href="/api/runnable">
+    Invoke, Stream, Collect, and Transform reference
+  </Card>
+</CardGroup>

@@ -1,0 +1,211 @@
+---
+title: "Agents: autonomous AI with tool use"
+description: "The Eino ADK defines the Agent interface and a Runner for autonomous AI with tool use, multi-agent coordination, and human-in-the-loop interrupt/resume."
+---
+
+An agent is an AI system that decides what to do next based on model output. In Eino, agents implement a single `Agent` interface and run through a `Runner` that manages their lifecycle, checkpoint persistence, and streaming. The Agent Development Kit (ADK) builds on top of `compose` — every agent is ultimately a graph or a loop over a graph — and adds the coordination layer on top.
+
+## The Agent interface
+
+Every agent in Eino satisfies this interface:
+
+```go
+type Agent interface {
+    Name(ctx context.Context) string
+    Description(ctx context.Context) string
+
+    // Run starts the agent and returns an iterator that yields events as they occur.
+    Run(ctx context.Context, input *AgentInput, options ...AgentRunOption) *AsyncIterator[*AgentEvent]
+}
+```
+
+`Name` and `Description` identify the agent to other agents in a multi-agent system and to DevOps tooling. `Run` starts the agent and returns an `AsyncIterator[*AgentEvent]` — an async pull-based stream of events that you consume with `Next`.
+
+## AgentInput and AgentEvent
+
+`AgentInput` carries the conversation messages and a flag that controls whether the agent should stream its model calls:
+
+```go
+type AgentInput struct {
+    Messages        []Message
+    EnableStreaming  bool
+}
+```
+
+`AgentEvent` is what the agent emits as it runs. Each event has an optional `Output` (a message or stream from the model or a tool), an optional `Action` (a control signal), and an optional `Err`:
+
+```go
+type AgentEvent struct {
+    AgentName string
+    RunPath   []RunStep    // execution path from root to this event source
+
+    Output *AgentOutput
+    Action *AgentAction
+    Err    error
+}
+```
+
+`AgentOutput` wraps a `MessageVariant` that can be either a complete `*schema.Message` or a `*schema.StreamReader[*schema.Message]`:
+
+```go
+type AgentOutput struct {
+    MessageOutput    *MessageVariant
+    CustomizedOutput any
+}
+```
+
+## AgentAction
+
+`AgentAction` carries control signals that an agent can emit during execution:
+
+```go
+type AgentAction struct {
+    Exit            bool                    // agent signals it is done
+    Interrupted     *InterruptInfo          // agent paused for human input
+    TransferToAgent *TransferToAgentAction  // hand off to another agent
+    BreakLoop       *BreakLoopAction        // exit current loop
+    CustomizedAction any
+}
+```
+
+When an agent is wrapped as a tool inside another agent, `Exit`, `TransferToAgent`, and `BreakLoop` actions are scoped to the inner agent's boundary and do not propagate to the parent.
+
+## Runner
+
+`Runner` is the primary entry point for executing an agent. It wraps an `Agent`, manages streaming mode, and optionally persists checkpoints for interrupt/resume.
+
+```go
+type RunnerConfig struct {
+    Agent           Agent
+    EnableStreaming  bool
+    CheckPointStore CheckPointStore
+}
+
+runner := adk.NewRunner(ctx, adk.RunnerConfig{Agent: agent})
+```
+
+`Runner` exposes three methods:
+
+- **`Run`** — starts a new execution with a slice of messages.
+- **`Query`** — convenience wrapper around `Run` that accepts a plain string.
+- **`Resume`** / **`ResumeWithParams`** — resumes from a saved checkpoint after an interrupt.
+
+## AsyncIterator pattern
+
+`Run` and `Query` return an `*AsyncIterator[*AgentEvent]`. Call `Next` in a loop to consume events as they arrive:
+
+```go
+iter := runner.Query(ctx, "Hello, who are you?")
+for {
+    event, ok := iter.Next()
+    if !ok {
+        break
+    }
+    if event.Err != nil {
+        // handle error
+    }
+    if event.Output != nil && event.Output.MessageOutput != nil {
+        fmt.Println(event.Output.MessageOutput.Message.Content)
+    }
+}
+```
+
+`Next` blocks until the next event is available or the iterator is exhausted.
+
+## ChatModelAgent and the ReAct loop
+
+`ChatModelAgent` is the built-in implementation of the classic ReAct (Reason + Act) pattern. Configure a chat model, optionally add tools, and you have a working agent:
+
+```go
+chatModel, _ := openai.NewChatModel(ctx, &openai.ChatModelConfig{
+    Model:  "gpt-4o",
+    APIKey: os.Getenv("OPENAI_API_KEY"),
+})
+
+agent, _ := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
+    Model: chatModel,
+})
+
+runner := adk.NewRunner(ctx, adk.RunnerConfig{Agent: agent})
+iter := runner.Query(ctx, "Hello, who are you?")
+for {
+    event, ok := iter.Next()
+    if !ok {
+        break
+    }
+    fmt.Println(event.Output.MessageOutput.Message.Content)
+}
+```
+
+Add tools to give the agent capabilities:
+
+```go
+agent, _ := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
+    Model: chatModel,
+    ToolsConfig: adk.ToolsConfig{
+        ToolsNodeConfig: compose.ToolsNodeConfig{
+            Tools: []tool.BaseTool{weatherTool, calculatorTool},
+        },
+    },
+})
+```
+
+The agent handles the ReAct loop internally — it calls the model, checks whether the model requested tool calls, executes those tools, feeds the results back, and repeats until the model produces a final answer with no tool calls.
+
+## ResumableAgent
+
+`ResumableAgent` extends `Agent` with a `Resume` method. Use it when an agent needs to pause for human input and continue from where it stopped:
+
+```go
+type ResumableAgent interface {
+    Agent
+
+    Resume(ctx context.Context, info *ResumeInfo, opts ...AgentRunOption) *AsyncIterator[*AgentEvent]
+}
+```
+
+When you configure the `Runner` with a `CheckPointStore`, it automatically saves state whenever an agent emits an `Interrupted` action. Call `runner.Resume` or `runner.ResumeWithParams` with the checkpoint ID to continue.
+
+```go
+runner := adk.NewRunner(ctx, adk.RunnerConfig{
+    Agent:           agent,
+    CheckPointStore: store,
+})
+
+iter := runner.Query(ctx, "Please approve this purchase")
+// ... consume events until Interrupted action ...
+
+// later, after human approves:
+resumeIter, _ := runner.Resume(ctx, checkPointID)
+```
+
+<Tip>
+`ResumeWithParams` lets you target specific interrupted components by address and provide them with resume data. Use it when multiple nested agents or tools paused simultaneously.
+</Tip>
+
+## Callbacks
+
+The ADK exposes a `ComponentOfAgent` constant so you can filter callback events to only agent-related activity:
+
+```go
+const ComponentOfAgent components.Component = "Agent"
+```
+
+Inject callback handlers at runner creation time to get `OnStart`, `OnEnd`, and `OnError` events for logging, tracing, and metrics.
+
+## Learn more
+
+<CardGroup cols={2}>
+  <Card title="ChatModelAgent" href="/adk/chat-model-agent">
+    Detailed guide to the built-in ReAct agent, tool configuration, and retry policies.
+  </Card>
+  <Card title="Multi-agent systems" href="/adk/multi-agent">
+    How to build supervisor, sequential, and plan-execute agent topologies.
+  </Card>
+  <Card title="Human-in-the-loop" href="/adk/human-in-the-loop">
+    Interrupt/resume patterns, checkpoint stores, and ResumeWithParams.
+  </Card>
+  <Card title="Prebuilt patterns" href="/adk/prebuilt-patterns">
+    Ready-to-use agent patterns including DeepAgent, Supervisor, and PlanExecute.
+  </Card>
+</CardGroup>

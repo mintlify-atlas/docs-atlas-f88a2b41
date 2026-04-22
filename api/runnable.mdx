@@ -1,0 +1,322 @@
+---
+title: "Runnable API: invoke, stream, collect, and transform"
+description: "Reference for Runnable[I,O] — the four execution paradigms (Invoke, Stream, Collect, Transform) returned by Graph.Compile and when to use each one."
+---
+
+`Runnable[I, O]` is the executable product of a compiled `Graph[I, O]` or `Chain[I, O]`. It exposes four methods that cover every combination of discrete and streaming input/output. Eino automatically derives any missing paradigm from the ones your underlying nodes implement, so you can call all four methods even if only one is natively supported.
+
+```go
+type Runnable[I, O any] interface {
+    Invoke(ctx context.Context, input I, opts ...Option) (output O, err error)
+    Stream(ctx context.Context, input I, opts ...Option) (output *schema.StreamReader[O], err error)
+    Collect(ctx context.Context, input *schema.StreamReader[I], opts ...Option) (output O, err error)
+    Transform(ctx context.Context, input *schema.StreamReader[I], opts ...Option) (output *schema.StreamReader[O], err error)
+}
+```
+
+---
+
+## Invoke
+
+```go
+func (r Runnable[I, O]) Invoke(
+    ctx context.Context,
+    input I,
+    opts ...Option,
+) (output O, err error)
+```
+
+Sends a single value and receives a single value — the classic request/response pattern. If the underlying graph only implements streaming, Eino drains the stream and concatenates the chunks before returning.
+
+**When to use:** You have a complete input and need a complete output. Most non-streaming use cases fit here.
+
+<ParamField path="ctx" type="context.Context" required>
+  Controls cancellation and carries per-call values such as callback state.
+</ParamField>
+
+<ParamField path="input" type="I" required>
+  The typed input value to run through the graph.
+</ParamField>
+
+<ParamField path="opts" type="...Option">
+  Per-invocation options. See [Option](#option) below.
+</ParamField>
+
+<ResponseField name="output" type="O">
+  The typed output produced by the graph's end node.
+</ResponseField>
+
+<ResponseField name="err" type="error">
+  Non-nil if any node returns an error or the context is cancelled.
+</ResponseField>
+
+```go
+runnable, _ := g.Compile(ctx)
+
+result, err := runnable.Invoke(ctx, "What is the capital of France?")
+if err != nil {
+    return err
+}
+fmt.Println(result) // "Paris"
+```
+
+---
+
+## Stream
+
+```go
+func (r Runnable[I, O]) Stream(
+    ctx context.Context,
+    input I,
+    opts ...Option,
+) (output *schema.StreamReader[O], err error)
+```
+
+Sends a single value and receives the output as a stream of chunks. If the underlying graph does not natively stream, the single output is wrapped in a one-element stream.
+
+**When to use:** You want to display tokens or partial results incrementally, for example to drive a streaming UI or handle large outputs that should not be held in memory all at once.
+
+<ParamField path="ctx" type="context.Context" required>
+  Controls cancellation and carries per-call values.
+</ParamField>
+
+<ParamField path="input" type="I" required>
+  The typed input value.
+</ParamField>
+
+<ParamField path="opts" type="...Option">
+  Per-invocation options.
+</ParamField>
+
+<ResponseField name="output" type="*schema.StreamReader[O]">
+  A stream of typed chunks. You must call `Close` on the reader when you are done — even if you break early from the receive loop.
+</ResponseField>
+
+<ResponseField name="err" type="error">
+  Non-nil if the graph failed to start the stream.
+</ResponseField>
+
+```go
+sr, err := runnable.Stream(ctx, "Tell me a story")
+if err != nil {
+    return err
+}
+defer sr.Close()
+
+for {
+    chunk, err := sr.Recv()
+    if errors.Is(err, io.EOF) {
+        break
+    }
+    if err != nil {
+        return err
+    }
+    fmt.Print(chunk)
+}
+```
+
+---
+
+## Collect
+
+```go
+func (r Runnable[I, O]) Collect(
+    ctx context.Context,
+    input *schema.StreamReader[I],
+    opts ...Option,
+) (output O, err error)
+```
+
+Receives a stream of input chunks and produces a single output value. Eino drains `input`, concatenates the chunks, and then runs the graph. If the underlying graph does not natively support streaming input, `Collect` concatenates the stream automatically before forwarding to `Invoke`.
+
+**When to use:** Your input arrives incrementally (e.g. from an upstream streaming node or a chunked upload) but you need a single complete result.
+
+<ParamField path="ctx" type="context.Context" required>
+  Controls cancellation and carries per-call values.
+</ParamField>
+
+<ParamField path="input" type="*schema.StreamReader[I]" required>
+  A stream of typed input chunks. Ownership transfers to the runnable; do not call `Close` or `Recv` on it after passing it here.
+</ParamField>
+
+<ParamField path="opts" type="...Option">
+  Per-invocation options.
+</ParamField>
+
+<ResponseField name="output" type="O">
+  The typed output produced after all input chunks have been consumed.
+</ResponseField>
+
+<ResponseField name="err" type="error">
+  Non-nil if reading the input stream or running the graph fails.
+</ResponseField>
+
+```go
+// Suppose inputStream is a *schema.StreamReader[string] from another node.
+result, err := runnable.Collect(ctx, inputStream)
+if err != nil {
+    return err
+}
+```
+
+---
+
+## Transform
+
+```go
+func (r Runnable[I, O]) Transform(
+    ctx context.Context,
+    input *schema.StreamReader[I],
+    opts ...Option,
+) (output *schema.StreamReader[O], err error)
+```
+
+Receives a stream of input chunks and produces a stream of output chunks — fully end-to-end streaming. Both the input and output remain live streams; no buffering or concatenation occurs unless a specific node requires it.
+
+**When to use:** You need maximum latency reduction in a pipeline where data flows continuously from source to sink. This is the most powerful paradigm but also the most complex to consume correctly.
+
+<ParamField path="ctx" type="context.Context" required>
+  Controls cancellation and carries per-call values.
+</ParamField>
+
+<ParamField path="input" type="*schema.StreamReader[I]" required>
+  A stream of typed input chunks. Ownership transfers to the runnable.
+</ParamField>
+
+<ParamField path="opts" type="...Option">
+  Per-invocation options.
+</ParamField>
+
+<ResponseField name="output" type="*schema.StreamReader[O]">
+  A stream of typed output chunks. You must call `Close` on this reader when done.
+</ResponseField>
+
+<ResponseField name="err" type="error">
+  Non-nil if the graph failed to start the transform.
+</ResponseField>
+
+```go
+inputStream := schema.StreamReaderFromArray([]string{"Hello", " world"})
+
+outStream, err := runnable.Transform(ctx, inputStream)
+if err != nil {
+    return err
+}
+defer outStream.Close()
+
+for {
+    chunk, err := outStream.Recv()
+    if errors.Is(err, io.EOF) {
+        break
+    }
+    if err != nil {
+        return err
+    }
+    fmt.Print(chunk)
+}
+```
+
+---
+
+## Paradigm selection guide
+
+| Input \ Output | Discrete | Streaming |
+|---|---|---|
+| **Discrete** | `Invoke` | `Stream` |
+| **Streaming** | `Collect` | `Transform` |
+
+---
+
+## Option
+
+`Option` carries per-invocation configuration that flows through the graph and is dispatched to individual nodes by type. You compose options from the helpers below and, if needed, restrict them to a specific node with `DesignateNode`.
+
+### DesignateNode
+
+```go
+func (o Option) DesignateNode(nodeKey ...string) Option
+```
+
+Limits the option to the named node(s). Without this, the option is broadcast to every node that understands its type.
+
+<ParamField path="nodeKey" type="...string" required>
+  One or more node keys in the top-level graph.
+</ParamField>
+
+```go
+opt := compose.WithChatModelOption(model.WithTemperature(0.9)).
+    DesignateNode("chat_model")
+
+runnable.Invoke(ctx, messages, opt)
+```
+
+### DesignateNodeWithPath
+
+```go
+func (o Option) DesignateNodeWithPath(path ...*NodePath) Option
+```
+
+Like `DesignateNode` but supports nested graphs. Use `NewNodePath("sub_graph_key", "inner_node_key")` to address a node inside a sub-graph.
+
+---
+
+### Component-specific option constructors
+
+These functions wrap component options into an `Option` that the graph can route to the right node type.
+
+```go
+func WithChatModelOption(opts ...model.Option) Option
+func WithChatTemplateOption(opts ...prompt.Option) Option
+func WithEmbeddingOption(opts ...embedding.Option) Option
+func WithRetrieverOption(opts ...retriever.Option) Option
+func WithIndexerOption(opts ...indexer.Option) Option
+func WithLoaderOption(opts ...document.LoaderOption) Option
+func WithDocumentTransformerOption(opts ...document.TransformerOption) Option
+func WithToolsNodeOption(opts ...ToolsNodeOption) Option
+func WithLambdaOption(opts ...any) Option
+```
+
+---
+
+### WithCallbacks
+
+```go
+func WithCallbacks(cbs ...callbacks.Handler) Option
+```
+
+Attaches callback handlers for a single invocation. The handlers receive lifecycle events (start, end, error) from every node in the graph.
+
+<ParamField path="cbs" type="...callbacks.Handler" required>
+  One or more callback implementations.
+</ParamField>
+
+---
+
+### WithRuntimeMaxSteps
+
+```go
+func WithRuntimeMaxSteps(maxSteps int) Option
+```
+
+Overrides the compile-time `WithMaxRunSteps` limit for this invocation only.
+
+<ParamField path="maxSteps" type="int" required>
+  Maximum node execution count for this call.
+</ParamField>
+
+```go
+runnable.Invoke(ctx, input, compose.WithRuntimeMaxSteps(100))
+```
+
+---
+
+## Automatic paradigm downgrade
+
+When a node only implements a subset of the four paradigms, Eino derives the rest automatically:
+
+- If only `Invoke` is provided: `Stream` wraps the output in a single-element stream; `Collect` concatenates the input then calls `Invoke`; `Transform` does both.
+- If only `Stream` is provided: `Invoke` drains and concatenates the stream.
+- If only `Collect` is provided: `Invoke` wraps the input in a single-element stream then calls `Collect`.
+- If only `Transform` is provided: all other paradigms are derived by combining buffering and wrapping as needed.
+
+This means you can freely call any of the four methods on any `Runnable`, regardless of what the underlying nodes natively support.

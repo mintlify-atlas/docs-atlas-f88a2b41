@@ -1,0 +1,197 @@
+---
+title: "Building sequential pipelines with compose.Chain"
+description: "Use compose.Chain to assemble components into a sequential pipeline with a fluent builder API, including parallel and branch sub-structures."
+---
+
+`compose.Chain` is a builder that wires components end-to-end in a single linear sequence. Each `AppendXX` call adds the next stage, and the framework automatically connects the output of one stage to the input of the next. Use Chain when your pipeline is fundamentally sequential and you want a concise, readable construction — reach for `compose.Graph` instead when you need explicit control over a non-linear topology.
+
+## Creating a chain
+
+`NewChain[I, O]()` constructs an empty chain typed by its input `I` and output `O`.
+
+```go
+import "github.com/cloudwego/eino/compose"
+
+chain := compose.NewChain[string, *schema.Message]()
+```
+
+Like `Graph`, Chain accepts `NewGraphOption` values — for example, `WithGenLocalState` to enable shared state across nodes.
+
+## Appending nodes
+
+Each `AppendXX` method returns the chain itself, so calls can be chained fluently.
+
+<Tabs>
+  <Tab title="Language model">
+
+```go
+chatModel, err := openai.NewChatModel(ctx, &openai.ChatModelConfig{
+    Model:  "gpt-4o",
+    APIKey: os.Getenv("OPENAI_API_KEY"),
+})
+if err != nil { ... }
+
+chain.AppendChatModel(chatModel)
+```
+
+  </Tab>
+  <Tab title="Prompt template">
+
+```go
+tmpl, err := prompt.FromMessages(schema.FString, &schema.Message{
+    Role:    schema.System,
+    Content: "You are a helpful assistant specialising in {domain}.",
+})
+if err != nil { ... }
+
+chain.AppendChatTemplate(tmpl)
+```
+
+  </Tab>
+  <Tab title="Tools node">
+
+```go
+toolsNode, err := compose.NewToolNode(ctx, &compose.ToolsNodeConfig{
+    Tools: []tool.BaseTool{searchTool},
+})
+if err != nil { ... }
+
+chain.AppendToolsNode(toolsNode)
+```
+
+  </Tab>
+  <Tab title="Lambda">
+
+```go
+formatFn := compose.InvokableLambda(func(ctx context.Context, msg *schema.Message) (string, error) {
+    return msg.Content, nil
+})
+
+chain.AppendLambda(formatFn)
+```
+
+  </Tab>
+</Tabs>
+
+The complete set of `Append` methods mirrors the node types available on `Graph`:
+
+| Method | Component type |
+|--------|---------------|
+| `AppendChatModel` | `model.BaseChatModel` |
+| `AppendChatTemplate` | `prompt.ChatTemplate` |
+| `AppendToolsNode` | `*compose.ToolsNode` |
+| `AppendLambda` | `*compose.Lambda` |
+| `AppendRetriever` | `retriever.Retriever` |
+| `AppendEmbedding` | `embedding.Embedder` |
+| `AppendLoader` | `document.Loader` |
+| `AppendIndexer` | `indexer.Indexer` |
+| `AppendDocumentTransformer` | `document.Transformer` |
+| `AppendGraph` | `compose.AnyGraph` (graph or chain) |
+| `AppendPassthrough` | — |
+
+## Building a complete pipeline
+
+The most common pattern is a prompt → model → tool call loop. Here is a simpler two-stage example:
+
+```go
+chain := compose.NewChain[[]*schema.Message, *schema.Message]()
+
+chain.
+    AppendChatTemplate(systemPrompt).
+    AppendChatModel(chatModel)
+
+runnable, err := chain.Compile(ctx,
+    compose.WithGraphName("chat_pipeline"),
+)
+if err != nil { ... }
+
+output, err := runnable.Invoke(ctx, messages)
+```
+
+## Parallel nodes
+
+`AppendParallel` adds a fan-out stage: all nodes in the `Parallel` receive the same input and run concurrently. The next stage in the chain receives a `map[string]any` keyed by the names you assigned.
+
+```go
+parallel := compose.NewParallel()
+parallel.AddChatModel("gpt", gptModel)
+parallel.AddChatModel("claude", claudeModel)
+
+chain := compose.NewChain[string, map[string]any]()
+chain.AppendParallel(parallel)
+// The next Append receives map[string]any{"gpt": ..., "claude": ...}
+```
+
+<Note>
+The next node after a `Parallel` must accept `map[string]any` as its input type, or you must use a Lambda to merge or select from the results.
+</Note>
+
+## Conditional branches
+
+`AppendBranch` adds a fan-out stage where only one branch executes, chosen at runtime by a condition function.
+
+```go
+cb := compose.NewChainBranch(func(ctx context.Context, msg *schema.Message) (string, error) {
+    if msg.ToolCalls != nil {
+        return "tools", nil
+    }
+    return "respond", nil
+})
+
+cb.AddToolsNode("tools", toolsNode)
+cb.AddLambda("respond", respondFn)
+
+chain.AppendBranch(cb)
+```
+
+All branches within a `ChainBranch` must lead to `END` or converge back to a common node further down the chain.
+
+## Compiling and running
+
+`Compile` validates the chain and returns a `Runnable[I, O]`. The same four execution paradigms are available as on any `Runnable`:
+
+```go
+runnable, err := chain.Compile(ctx)
+if err != nil { ... }
+
+// One input → one output
+output, err := runnable.Invoke(ctx, input)
+
+// One input → stream of output chunks
+stream, err := runnable.Stream(ctx, input)
+defer stream.Close()
+
+// Stream of input chunks → one output
+output, err := runnable.Collect(ctx, inputStream)
+
+// Stream of input chunks → stream of output chunks
+outStream, err := runnable.Transform(ctx, inputStream)
+defer outStream.Close()
+```
+
+## Chain vs Graph
+
+| | Chain | Graph |
+|---|---|---|
+| Edge declaration | Implicit — each `Append` connects to the previous node | Explicit — you call `AddEdge` for every connection |
+| Topology | Sequential with optional `Parallel` / `Branch` sub-structures | Arbitrary DAG or cyclic (Pregel) |
+| Cycles | Not supported | Supported in Pregel mode |
+| API style | Fluent builder | Imperative node + edge registration |
+| Best for | Linear pipelines with optional fan-out | Complex routing, loops, sub-graphs |
+
+A `Chain` implements `AnyGraph`, so you can embed it inside a `Graph` using `graph.AddGraphNode`, or inside another `Chain` using `chain.AppendGraph`.
+
+<CardGroup cols={2}>
+  <Card title="Graph" href="/composition/graph">
+    Full control over topology with explicit edges and branches
+  </Card>
+  <Card title="Workflow" href="/composition/workflow">
+    Declarative field-mapping approach to node dependencies
+  </Card>
+  <Card title="Streaming" href="/composition/streaming">
+    The four runnable paradigms and StreamReader usage
+  </Card>
+  <Card title="Runnable API" href="/api/runnable">
+    Invoke, Stream, Collect, and Transform reference
+  </Card>
+</CardGroup>

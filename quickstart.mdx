@@ -1,80 +1,171 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: "Get started with Eino"
+description: "Install the Eino Go module, connect a ChatModel backed by OpenAI, create a ChatModelAgent with the ADK, and run your first query in a few minutes."
 ---
 
-## Get started in three steps
+In this guide you will install Eino, configure a ChatModel backed by OpenAI, create a `ChatModelAgent` that handles the ReAct loop for you, and run a query against it. You will also see how to add tools to your agent and how to build a composed graph for when you need precise control over execution flow.
 
-Get your documentation site running locally and make your first customization.
+<Steps>
 
-### Step 1: Set up your local environment
+<Step title="Install Eino">
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+Add the core Eino module to your project:
 
-### Step 2: Deploy your changes
+```bash
+go get github.com/cloudwego/eino
+```
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+You also need an implementation for the model provider you want to use. For OpenAI:
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+```bash
+go get github.com/cloudwego/eino-ext/components/model/openai
+```
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+See [Installing Eino and its dependencies](/installation) for a full list of available implementations.
 
-### Step 3: Go live
+</Step>
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+<Step title="Configure a ChatModel">
+
+Create a `ChatModel` using the OpenAI implementation. The model is the bridge between Eino and the LLM API.
+
+```go
+import (
+    "context"
+    "os"
+
+    "github.com/cloudwego/eino-ext/components/model/openai"
+)
+
+ctx := context.Background()
+
+chatModel, err := openai.NewChatModel(ctx, &openai.ChatModelConfig{
+    Model:  "gpt-4o",
+    APIKey: os.Getenv("OPENAI_API_KEY"),
+})
+if err != nil {
+    // handle error
+}
+```
+
+`ChatModel` is an interface defined in the core `eino` module. Swapping providers — for example, switching from OpenAI to Ollama — requires only changing this initialization call.
+
+</Step>
+
+<Step title="Create an agent">
+
+Pass the `ChatModel` to `adk.NewChatModelAgent`. The agent handles the ReAct loop internally: it decides when to call tools and when to return a response.
+
+```go
+import "github.com/cloudwego/eino/adk"
+
+agent, err := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
+    Model: chatModel,
+})
+if err != nil {
+    // handle error
+}
+```
+
+</Step>
+
+<Step title="Run queries with a Runner">
+
+`adk.NewRunner` wraps an agent and provides the `Query` convenience method. It returns an `AsyncIterator` that yields `AgentEvent` values as the model streams its response.
+
+```go
+runner := adk.NewRunner(ctx, adk.RunnerConfig{Agent: agent})
+
+iter := runner.Query(ctx, "Hello, who are you?")
+for {
+    event, ok := iter.Next()
+    if !ok {
+        break
+    }
+    if event.Err != nil {
+        log.Printf("error: %v", event.Err)
+        continue
+    }
+    if event.Output != nil && event.Output.MessageOutput != nil {
+        msg, err := event.Output.MessageOutput.GetMessage()
+        if err == nil {
+            fmt.Println(msg.Content)
+        }
+    }
+}
+```
+
+</Step>
+
+</Steps>
+
+## Add tools to your agent
+
+Give the agent capabilities by passing tools through `ToolsConfig`. The agent automatically receives tool descriptions, decides when to call each tool, and loops until it has a final answer.
+
+```go
+import (
+    "github.com/cloudwego/eino/adk"
+    "github.com/cloudwego/eino/components/tool"
+    "github.com/cloudwego/eino/compose"
+)
+
+agent, err := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
+    Model: chatModel,
+    ToolsConfig: adk.ToolsConfig{
+        ToolsNodeConfig: compose.ToolsNodeConfig{
+            Tools: []tool.BaseTool{weatherTool, calculatorTool},
+        },
+    },
+})
+```
+
+Any value that implements `tool.BaseTool` can be passed here. See the [eino-ext](https://github.com/cloudwego/eino-ext) repository for ready-made tool implementations, or implement the interface yourself.
+
+## Build a composed graph
+
+When you need precise control over execution flow — fixed ordering, conditional branching, or parallel steps — use `compose.NewGraph` instead of the ADK agent pattern.
+
+```go
+import "github.com/cloudwego/eino/compose"
+
+graph := compose.NewGraph[*Input, *Output]()
+graph.AddLambdaNode("validate", validateFn)
+graph.AddChatModelNode("generate", chatModel)
+graph.AddLambdaNode("format", formatFn)
+
+graph.AddEdge(compose.START, "validate")
+graph.AddEdge("validate", "generate")
+graph.AddEdge("generate", "format")
+graph.AddEdge("format", compose.END)
+
+runnable, err := graph.Compile(ctx)
+if err != nil {
+    // handle error
+}
+
+result, err := runnable.Invoke(ctx, input)
+```
+
+Graphs are typed: the compiler checks that each edge's output type matches the next node's input type. You can also expose a compiled graph as a tool and pass it to an agent, letting the agent decide when to invoke your deterministic pipeline.
+
+<Tip>
+  For working examples of agents, multi-agent coordination, human-in-the-loop, and graph tools, see [cloudwego/eino-examples](https://github.com/cloudwego/eino-examples).
+</Tip>
 
 ## Next steps
 
-Now that you have your docs running, explore these key features:
-
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="ChatModelAgent" icon="robot" href="/adk/chat-model-agent">
+    Explore instructions, output keys, middleware, and interrupt/resume.
+  </Card>
+  <Card title="Graph composition" icon="diagram-project" href="/composition/graph">
+    Learn branching, parallel nodes, state, and streaming in graphs.
+  </Card>
+  <Card title="Callbacks" icon="bell" href="/observability/callbacks">
+    Inject logging, tracing, and metrics into components and graphs.
+  </Card>
+  <Card title="ChatModel API" icon="code" href="/api/chat-model">
+    Full interface reference for the ChatModel component.
+  </Card>
 </CardGroup>
-
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>

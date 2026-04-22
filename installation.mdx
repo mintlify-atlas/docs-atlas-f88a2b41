@@ -1,0 +1,86 @@
+---
+title: "Installing Eino and its dependencies"
+description: "Add the core Eino module with go get, then install only the component implementations you need from eino-ext — one separate Go module per provider."
+---
+
+Eino is split across two repositories. The core `github.com/cloudwego/eino` module defines interfaces, the streaming mechanism, composition primitives, and the Agent Development Kit. Concrete implementations — specific model providers, vector databases, document loaders, and so on — live in [`github.com/cloudwego/eino-ext`](https://github.com/cloudwego/eino-ext) as separate Go modules. You import only what you use.
+
+Eino requires **Go 1.18 or later**.
+
+## Install the core module
+
+```bash
+go get github.com/cloudwego/eino
+```
+
+This gives you the `compose`, `adk`, `schema`, and `components` packages. You can define your own component implementations against these interfaces immediately, but you will need at least one model implementation to make LLM calls.
+
+## Add model implementations
+
+Each model provider is a separate module under `eino-ext`. Install the one that matches your provider:
+
+<CodeGroup>
+
+```bash OpenAI
+go get github.com/cloudwego/eino-ext/components/model/openai
+```
+
+```bash Ollama
+go get github.com/cloudwego/eino-ext/components/model/ollama
+```
+
+```bash Claude (Anthropic)
+go get github.com/cloudwego/eino-ext/components/model/claude
+```
+
+```bash Gemini (Google)
+go get github.com/cloudwego/eino-ext/components/model/gemini
+```
+
+```bash Ark (Volcengine)
+go get github.com/cloudwego/eino-ext/components/model/ark
+```
+
+</CodeGroup>
+
+## Add other component implementations
+
+The same pattern applies to every component type. Install only the packages your project needs:
+
+| Component | Example module path |
+|---|---|
+| Embedding | `github.com/cloudwego/eino-ext/components/embedding/openai` |
+| Retriever | `github.com/cloudwego/eino-ext/components/retriever/es8` |
+| Document loader | `github.com/cloudwego/eino-ext/components/document/loader/url` |
+| Document transformer | `github.com/cloudwego/eino-ext/components/document/transformer/splitter/markdown` |
+
+Browse the full list of available implementations in the [eino-ext repository](https://github.com/cloudwego/eino-ext).
+
+## Module structure summary
+
+```
+github.com/cloudwego/eino                          ← core: interfaces, streaming, compose, adk
+github.com/cloudwego/eino-ext/components/model/openai  ← OpenAI ChatModel + Embedder
+github.com/cloudwego/eino-ext/components/model/ollama  ← Ollama ChatModel
+github.com/cloudwego/eino-ext/components/retriever/es8 ← Elasticsearch retriever
+...
+```
+
+<Note>
+  Because each implementation is its own Go module, you only pull in the dependencies (HTTP clients, SDK libraries, etc.) for the providers you actually use. There is no single "batteries included" import.
+</Note>
+
+## Verify your installation
+
+After running `go get`, confirm the modules are present in your `go.mod`:
+
+```bash
+go mod tidy
+cat go.mod
+```
+
+You should see `github.com/cloudwego/eino` and any `eino-ext` packages you installed listed under `require`.
+
+<Tip>
+  If you are just exploring, the [quickstart](/quickstart) walks you through a complete working example using the OpenAI model implementation.
+</Tip>

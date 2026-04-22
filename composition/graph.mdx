@@ -1,0 +1,288 @@
+---
+title: "Building execution graphs with compose.Graph"
+description: "Use compose.Graph to orchestrate components into directed graphs with explicit edges, conditional branches, cycles, and shared state."
+---
+
+`compose.Graph` gives you full control over execution flow. You define every node and every edge explicitly, which makes Graph the right choice when you need conditional routing, cycles (via Pregel mode), shared state across nodes, or any topology that does not fit a simple linear pipeline.
+
+## Creating a graph
+
+`NewGraph[I, O]()` constructs a graph parameterised by its input type `I` and output type `O`. The compiled `Runnable` will accept `I` and return `O`.
+
+```go
+import "github.com/cloudwego/eino/compose"
+
+graph := compose.NewGraph[*Input, *Output]()
+```
+
+The two sentinel constants `compose.START` and `compose.END` mark where execution enters and exits the graph. Every path through the graph must start from `START` and eventually reach `END`.
+
+## Adding nodes
+
+Each `AddXXNode` method registers a component under a string key. The key uniquely identifies the node within the graph and is used when wiring edges.
+
+<AccordionGroup>
+  <Accordion title="AddLambdaNode — arbitrary functions">
+
+Use a Lambda when you need custom logic that does not map to a named component interface. Create the Lambda with one of the constructor helpers, then add it to the graph.
+
+```go
+validateFn := compose.InvokableLambda(func(ctx context.Context, in *Input) (*Input, error) {
+    if in.Query == "" {
+        return nil, errors.New("query is required")
+    }
+    return in, nil
+})
+
+graph.AddLambdaNode("validate", validateFn)
+```
+
+  </Accordion>
+  <Accordion title="AddChatModelNode — language models">
+
+```go
+import "github.com/cloudwego/eino/components/model"
+
+chatModel, err := openai.NewChatModel(ctx, &openai.ChatModelConfig{
+    Model:  "gpt-4o",
+    APIKey: os.Getenv("OPENAI_API_KEY"),
+})
+if err != nil { ... }
+
+graph.AddChatModelNode("llm", chatModel)
+```
+
+  </Accordion>
+  <Accordion title="AddToolsNode — tool execution">
+
+```go
+toolsNode, err := compose.NewToolNode(ctx, &compose.ToolsNodeConfig{
+    Tools: []tool.BaseTool{searchTool, calcTool},
+})
+if err != nil { ... }
+
+graph.AddToolsNode("tools", toolsNode)
+```
+
+  </Accordion>
+  <Accordion title="AddRetrieverNode — document retrieval">
+
+```go
+retriever, err := vikingdb.NewRetriever(ctx, &vikingdb.RetrieverConfig{})
+if err != nil { ... }
+
+graph.AddRetrieverNode("retriever", retriever)
+```
+
+  </Accordion>
+  <Accordion title="AddEmbeddingNode — text embeddings">
+
+```go
+embedder, err := openai.NewEmbedder(ctx, &openai.EmbeddingConfig{
+    Model: "text-embedding-3-small",
+})
+if err != nil { ... }
+
+graph.AddEmbeddingNode("embed", embedder)
+```
+
+  </Accordion>
+  <Accordion title="AddChatTemplateNode — prompt templates">
+
+```go
+tmpl, err := prompt.FromMessages(schema.FString, &schema.Message{
+    Role:    schema.System,
+    Content: "You are a helpful assistant for {topic}.",
+})
+if err != nil { ... }
+
+graph.AddChatTemplateNode("prompt", tmpl)
+```
+
+  </Accordion>
+  <Accordion title="AddGraphNode — nested graphs and chains">
+
+Any compiled `Graph` or `Chain` can itself be a node in a larger graph. This lets you build reusable sub-graphs and compose them hierarchically.
+
+```go
+subGraph := compose.NewGraph[string, string]()
+// ... build subGraph ...
+
+graph.AddGraphNode("sub", subGraph)
+```
+
+  </Accordion>
+</AccordionGroup>
+
+## Wiring edges
+
+Call `AddEdge` to declare that the output of one node flows into the input of another.
+
+```go
+graph := compose.NewGraph[*Input, *Output]()
+
+graph.AddLambdaNode("validate", validateFn)
+graph.AddChatModelNode("llm", chatModel)
+graph.AddLambdaNode("format", formatFn)
+
+graph.AddEdge(compose.START, "validate")
+graph.AddEdge("validate", "llm")
+graph.AddEdge("llm", "format")
+graph.AddEdge("format", compose.END)
+```
+
+Both the start node and the end node must be added to the graph before you call `AddEdge`. Eino validates type compatibility between connected nodes at compile time.
+
+## Conditional branching
+
+`GraphBranch` lets execution choose a successor node at runtime based on the current value. You define a condition function that receives the node output and returns the key of the next node to run.
+
+```go
+condition := func(ctx context.Context, in *schema.Message) (string, error) {
+    if in.ToolCalls != nil {
+        return "tools", nil
+    }
+    return "respond", nil
+}
+
+endNodes := map[string]bool{"tools": true, "respond": true}
+branch := compose.NewGraphBranch(condition, endNodes)
+
+graph.AddBranch("llm", branch)
+```
+
+All possible destination node keys must be declared in the `endNodes` map so the framework can validate the graph structure at compile time. The condition function runs at execution time and picks exactly one destination.
+
+For streaming input, use `compose.NewStreamGraphBranch` with a `StreamGraphBranchCondition[T]` that receives a `*schema.StreamReader[T]`.
+
+## Compiling a graph
+
+`Compile` validates the graph structure, checks type compatibility on every edge, and returns a `Runnable[I, O]`. Call `Compile` once; the resulting `Runnable` is safe to use concurrently.
+
+```go
+runnable, err := graph.Compile(ctx,
+    compose.WithGraphName("my_pipeline"),
+    compose.WithMaxRunSteps(50),
+)
+if err != nil { ... }
+
+output, err := runnable.Invoke(ctx, input)
+```
+
+Key `GraphCompileOption` values:
+
+| Option | Effect |
+|--------|--------|
+| `WithGraphName(name)` | Attaches a name for debugging and tracing |
+| `WithMaxRunSteps(n)` | Caps the number of execution steps; prevents infinite loops |
+| `WithNodeTriggerMode(mode)` | Sets `AllPredecessor` (DAG) or `AnyPredecessor` (Pregel, default) |
+| `WithEagerExecutionDisabled()` | Forces super-step batching even in DAG mode |
+
+## DAG vs Pregel execution modes
+
+Graph supports two runtime engines, selected at compile time via `WithNodeTriggerMode`.
+
+<Tabs>
+  <Tab title="Pregel (default)">
+
+The default `AnyPredecessor` mode uses Pregel-style super-steps. A node becomes eligible to run as soon as **any** of its predecessors completes. This mode supports **cycles** in the graph.
+
+```go
+runnable, err := graph.Compile(ctx)
+// AnyPredecessor is the default — no option needed
+```
+
+Use Pregel when you need loops, such as a ReAct agent that repeatedly calls a model until it decides to stop.
+
+  </Tab>
+  <Tab title="DAG">
+
+`AllPredecessor` mode runs nodes only when **all** their predecessors have completed. This mode requires a directed acyclic graph (no cycles).
+
+```go
+runnable, err := graph.Compile(ctx,
+    compose.WithNodeTriggerMode(compose.AllPredecessor),
+)
+```
+
+Use DAG mode when your graph is a strict pipeline where fan-in nodes must wait for all upstream results before proceeding.
+
+  </Tab>
+</Tabs>
+
+## Shared state across nodes
+
+When you need to pass auxiliary data (counters, accumulated results, user context) between nodes without threading it through the main data type, use `WithGenLocalState` to attach per-run state to the graph.
+
+```go
+type AgentState struct {
+    ToolCallCount int
+    UserID        string
+}
+
+graph := compose.NewGraph[*Input, *Output](
+    compose.WithGenLocalState(func(ctx context.Context) *AgentState {
+        return &AgentState{}
+    }),
+)
+```
+
+Nodes access the state through pre- and post-handlers:
+
+```go
+graph.AddChatModelNode("llm", chatModel,
+    compose.WithStatePreHandler(func(ctx context.Context, in []*schema.Message, state *AgentState) ([]*schema.Message, error) {
+        // Inject user context into the messages before the model runs.
+        return in, nil
+    }),
+    compose.WithStatePostHandler(func(ctx context.Context, out *schema.Message, state *AgentState) (*schema.Message, error) {
+        if out.ToolCalls != nil {
+            state.ToolCallCount++
+        }
+        return out, nil
+    }),
+)
+```
+
+State is created fresh for each `Invoke` / `Stream` call and is not shared across concurrent calls.
+
+## Exposing a graph as a tool
+
+Any compiled graph can be wrapped as a `tool.BaseTool` so agents can invoke it as part of their ReAct loop.
+
+```go
+// graphtool is available in the eino-examples repository:
+// github.com/cloudwego/eino-examples/adk/common/tool/graphtool
+graphTool, err := graphtool.NewInvokableGraphTool(
+    graph,
+    "data_pipeline",
+    "Process and validate incoming data records",
+)
+if err != nil { ... }
+
+agent, err := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
+    Model: chatModel,
+    ToolsConfig: adk.ToolsConfig{
+        ToolsNodeConfig: compose.ToolsNodeConfig{
+            Tools: []tool.BaseTool{graphTool},
+        },
+    },
+})
+```
+
+This bridges deterministic, typed pipelines with the open-ended reasoning of an LLM agent.
+
+<CardGroup cols={2}>
+  <Card title="Chain" href="/composition/chain">
+    Build sequential pipelines with a fluent builder API
+  </Card>
+  <Card title="Workflow" href="/composition/workflow">
+    Declare dependencies between nodes instead of explicit edges
+  </Card>
+  <Card title="Streaming" href="/composition/streaming">
+    Understand the four streaming paradigms and StreamReader
+  </Card>
+  <Card title="Runnable API" href="/api/runnable">
+    Invoke, Stream, Collect, and Transform reference
+  </Card>
+</CardGroup>

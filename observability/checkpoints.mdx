@@ -1,0 +1,260 @@
+---
+title: "Checkpoints: state persistence and resume"
+description: "Persist graph execution state at runtime so you can interrupt a run, save its progress, and resume it later from exactly where it stopped."
+---
+
+Checkpoints let a compiled Eino graph save its full runtime state — node outputs, channel values, and any user-defined state — to durable storage after each super-step. When a graph is interrupted (by a node calling `compose.Interrupt`, by the `WithInterruptBeforeNodes`/`WithInterruptAfterNodes` compile options, or by a crash), the checkpoint preserves enough information to restart the run from precisely the interrupted point rather than from the beginning. This enables human-in-the-loop workflows, long-running agentic pipelines, and crash recovery.
+
+## The CheckPointStore interface
+
+You provide the storage backend by implementing `CheckPointStore`:
+
+```go
+type CheckPointStore interface {
+    Get(ctx context.Context, checkPointID string) ([]byte, bool, error)
+    Set(ctx context.Context, checkPointID string, checkPoint []byte) error
+}
+```
+
+`Get` must return `(data, true, nil)` when the checkpoint exists and `(nil, false, nil)` when it does not. `Set` receives the serialized checkpoint bytes and persists them under the given ID. You can back this with Redis, a SQL database, an in-memory map for tests, or any other store.
+
+## Attaching a store at compile time
+
+Pass `WithCheckPointStore` as a `GraphCompileOption` when you compile your graph:
+
+```go
+store := NewRedisCheckPointStore(redisClient)
+
+runnable, err := graph.Compile(ctx,
+    compose.WithCheckPointStore(store),
+    compose.WithInterruptBeforeNodes([]string{"human-review"}),
+)
+```
+
+<Note>
+A checkpoint store has no effect unless the graph can also be interrupted. Combine `WithCheckPointStore` with `WithInterruptBeforeNodes`, `WithInterruptAfterNodes`, or nodes that call `compose.Interrupt` / `compose.StatefulInterrupt` directly.
+</Note>
+
+## Custom serialization
+
+By default Eino uses its internal serializer (based on `encoding/gob`). Supply a `WithSerializer` option to use a different encoding — for example, JSON or MessagePack:
+
+```go
+type JSONSerializer struct{}
+
+func (s *JSONSerializer) Marshal(v any) ([]byte, error) {
+    return json.Marshal(v)
+}
+
+func (s *JSONSerializer) Unmarshal(data []byte, v any) error {
+    return json.Unmarshal(data, v)
+}
+
+runnable, err := graph.Compile(ctx,
+    compose.WithCheckPointStore(store),
+    compose.WithSerializer(&JSONSerializer{}),
+)
+```
+
+The `Serializer` interface requires only two methods:
+
+```go
+type Serializer interface {
+    Marshal(v any) ([]byte, error)
+    Unmarshal(data []byte, v any) error
+}
+```
+
+## Registering custom types for serialization
+
+The default gob-based serializer needs to know the concrete types it may encounter inside a checkpoint. Built-in Eino types (`schema.Message`, `schema.Document`, `schema.ToolCall`, and many others) are pre-registered. For any custom type you use as graph state or inside an interface field, call `schema.RegisterName[T](name)` in an `init` function:
+
+```go
+func init() {
+    // Register your custom state struct
+    schema.RegisterName[*MyGraphState]("my_app_graph_state")
+
+    // Register a concrete type that implements an interface stored in state
+    schema.RegisterName[*MyToolResult]("my_app_tool_result")
+}
+```
+
+`schema.RegisterName` accepts a stable string name that is embedded in the serialized bytes. Changing the name breaks backward compatibility with existing checkpoints, so choose names carefully and keep them stable across deployments.
+
+<Warning>
+`compose.RegisterSerializableType[T](name)` is **deprecated**. Use `schema.RegisterName[T](name)` instead.
+</Warning>
+
+### What to register
+
+| Register | Do not register |
+|---|---|
+| Top-level types used as graph state | Struct fields with concrete types (`string`, `int`, nested structs) |
+| Concrete types assigned to interface fields | Slice or map types whose element types are already registered |
+
+### Pre-registered built-in types
+
+The following types are already registered and do not need explicit calls:
+
+- `schema.Message`, `[]*schema.Message`
+- `schema.Document`
+- `schema.ToolCall`, `schema.FunctionCall`
+- `schema.ResponseMeta`, `schema.TokenUsage`, `schema.LogProbs`
+- `schema.ChatMessagePart` and all part subtypes (image, audio, video, file)
+- Internal graph channel and checkpoint types
+
+## Checkpoint run options
+
+These options are passed at invocation time (not at compile time):
+
+| Option | Purpose |
+|---|---|
+| `WithCheckPointID(id string)` | Load an existing checkpoint with this ID and write progress to the same ID |
+| `WithWriteToCheckPointID(id string)` | Write progress to a different ID than the one loaded |
+| `WithForceNewRun()` | Ignore any existing checkpoint and run from the beginning |
+| `WithStateModifier(sm StateModifier)` | Apply a modifier to checkpoint state during read/write (advanced) |
+
+```go
+// First run — graph executes, is interrupted, and saves a checkpoint
+_, err = runnable.Invoke(ctx, input, compose.WithCheckPointID("run-42"))
+info, ok := compose.ExtractInterruptInfo(err)
+// inspect info.InterruptContexts to find interrupt IDs
+
+// Resume run — load the checkpoint and continue
+resumeCtx := compose.ResumeWithData(ctx, interruptID, humanFeedback)
+output, err := runnable.Invoke(resumeCtx, input, compose.WithCheckPointID("run-42"))
+```
+
+If you want to preserve the original checkpoint unchanged while writing new progress elsewhere:
+
+```go
+output, err := runnable.Invoke(resumeCtx, input,
+    compose.WithCheckPointID("run-42"),           // load from here
+    compose.WithWriteToCheckPointID("run-42-v2"), // write to here
+)
+```
+
+## What gets persisted
+
+A checkpoint captures the full graph state at the point of interruption:
+
+- **Channel values** — the outputs produced by every completed node, keyed by channel name
+- **Pending node inputs** — inputs waiting to be consumed by nodes that had not yet run
+- **User-defined state** — any state struct managed by the graph
+- **Interrupt addresses** — the hierarchical address of each interrupted node, used to route resume signals
+- **Sub-graph checkpoints** — nested graphs have their own checkpoints embedded recursively
+
+## Interrupt and resume workflow
+
+<Steps>
+  <Step title="Compile the graph with a store and interrupt points">
+    Attach a `CheckPointStore` and declare which nodes can be interrupted:
+
+    ```go
+    store := NewMyStore()
+
+    runnable, err := graph.Compile(ctx,
+        compose.WithCheckPointStore(store),
+        compose.WithInterruptBeforeNodes([]string{"human-review"}),
+    )
+    ```
+  </Step>
+
+  <Step title="Run the graph — it pauses at the interrupt point">
+    On the first invocation, the graph runs until it reaches an interrupt point and saves a checkpoint. The error returned is an interrupt error, not a failure:
+
+    ```go
+    const checkpointID = "session-abc"
+
+    _, err = runnable.Invoke(ctx, input, compose.WithCheckPointID(checkpointID))
+    if err != nil {
+        info, ok := compose.ExtractInterruptInfo(err)
+        if !ok {
+            log.Fatal("unexpected error:", err)
+        }
+        // info.InterruptContexts contains the interrupt IDs and any info
+        // the interrupted node provided (e.g. a question for the human)
+        for _, ic := range info.InterruptContexts {
+            fmt.Println("interrupted at:", ic.ID, "info:", ic.Info)
+        }
+    }
+    ```
+  </Step>
+
+  <Step title="Collect human input or perform external work">
+    While the graph is paused, your application can:
+
+    - Display the interrupt info to a human and collect their response
+    - Call an external API and wait for a webhook
+    - Store the checkpoint ID for later async resumption
+
+    ```go
+    // Example: collect human feedback synchronously
+    interruptID := info.InterruptContexts[0].ID
+    humanResponse := collectHumanApproval(interruptID)
+    ```
+  </Step>
+
+  <Step title="Resume the graph from the checkpoint">
+    Build a resume context and re-invoke the graph with the same checkpoint ID. The graph reloads its state and continues from the interrupted node:
+
+    ```go
+    resumeCtx := compose.ResumeWithData(ctx, interruptID, humanResponse)
+
+    output, err := runnable.Invoke(
+        resumeCtx,
+        input, // original input (ignored for resumed nodes, but still required)
+        compose.WithCheckPointID(checkpointID),
+    )
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println("final output:", output)
+    ```
+  </Step>
+</Steps>
+
+## Resume helpers
+
+| Function | Purpose |
+|---|---|
+| `compose.Resume(ctx, interruptIDs...)` | Resume one or more interrupt points without providing data |
+| `compose.ResumeWithData(ctx, interruptID, data)` | Resume a single interrupt point and pass typed data to it |
+| `compose.BatchResumeWithData(ctx, map[string]any)` | Resume multiple interrupt points with independent data values |
+
+Inside the interrupted node, retrieve the persisted state and the resume data:
+
+```go
+// Inside your node's implementation:
+wasInterrupted, hasState, state := compose.GetInterruptState[MyState](ctx)
+isResumeFlow, hasData, data := compose.GetResumeContext[HumanFeedback](ctx)
+```
+
+## Migrating checkpoints after a schema change
+
+If you change your graph state type between deployments and have existing checkpoints you do not want to discard, use `MigrateCheckpointState`:
+
+```go
+migratedBytes, err := compose.MigrateCheckpointState(
+    rawCheckpointBytes,
+    serializer,
+    func(state any) (any, bool, error) {
+        old, ok := state.(*OldState)
+        if !ok {
+            return state, false, nil // not this type — leave unchanged
+        }
+        return &NewState{Field: old.Field, NewField: defaultValue}, true, nil
+    },
+)
+```
+
+The migration callback returns `(newState, changed, error)`. If `changed` is `false`, the state is left as-is. The original bytes are returned unchanged when no state was modified anywhere in the checkpoint tree.
+
+<CardGroup cols={2}>
+  <Card title="Human-in-the-loop" href="/adk/human-in-the-loop">
+    Full patterns for human approval and feedback in agentic graphs
+  </Card>
+  <Card title="Callbacks" href="/observability/callbacks">
+    Log, trace, and measure every component invocation
+  </Card>
+</CardGroup>

@@ -1,0 +1,255 @@
+---
+title: "Stream processing in Eino graphs and agents"
+description: "Eino automatically handles streaming across graph nodes — concatenation, boxing, merging, and fan-out — so components only implement what they need."
+---
+
+Eino is built around streaming as a first-class concept. Language models produce token-by-token output; retrieval and embedding components return results all at once. When you compose these components in a graph, chain, or workflow, the framework transparently bridges the different streaming behaviours so that every node pair remains compatible without you writing conversion code.
+
+## The four runnable paradigms
+
+Every compiled graph, chain, or workflow implements `Runnable[I, O]`, which exposes four methods corresponding to the four ways data can flow through a component.
+
+<Tabs>
+  <Tab title="Invoke">
+
+**One input → one output.** The classic request/response pattern. The caller blocks until the entire computation completes.
+
+```go
+output, err := runnable.Invoke(ctx, input)
+if err != nil { ... }
+fmt.Println(output)
+```
+
+Internally, if any node in the graph only implements `Stream`, Eino automatically concatenates the stream into a single value before passing it to the next node.
+
+  </Tab>
+  <Tab title="Stream">
+
+**One input → streaming output.** The graph begins processing immediately and yields output chunks as they become available. This is the right choice when you want to forward a language model's tokens to a client as they are generated.
+
+```go
+stream, err := runnable.Stream(ctx, input)
+if err != nil { ... }
+defer stream.Close()
+
+for {
+    chunk, err := stream.Recv()
+    if errors.Is(err, io.EOF) {
+        break
+    }
+    if err != nil { ... }
+    fmt.Print(chunk)
+}
+```
+
+  </Tab>
+  <Tab title="Collect">
+
+**Streaming input → one output.** Accepts a `*schema.StreamReader[I]` representing a stream of input chunks, collects all of them, and returns a single output value. Useful when upstream produces a stream but downstream needs the full aggregated value.
+
+```go
+inputStream := schema.StreamReaderFromArray([]string{"chunk1", "chunk2", "chunk3"})
+
+output, err := runnable.Collect(ctx, inputStream)
+if err != nil { ... }
+```
+
+  </Tab>
+  <Tab title="Transform">
+
+**Streaming input → streaming output.** The most general form: accepts a stream and produces a stream. Components that implement `Transform` can process data incrementally without ever materialising the full input or output.
+
+```go
+inputStream := // ... *schema.StreamReader[I]
+
+outStream, err := runnable.Transform(ctx, inputStream)
+if err != nil { ... }
+defer outStream.Close()
+
+for {
+    chunk, err := outStream.Recv()
+    if errors.Is(err, io.EOF) {
+        break
+    }
+    if err != nil { ... }
+    process(chunk)
+}
+```
+
+  </Tab>
+</Tabs>
+
+## How the framework bridges paradigms automatically
+
+Components only need to implement the paradigms that make sense for them. A language model implements `Stream` (token by token) and optionally `Invoke`. A retriever typically only implements `Invoke`. When you connect them in a graph:
+
+- If the upstream node produces a stream but the downstream node only accepts a single value, Eino **concatenates** the stream before passing it on.
+- If the upstream node produces a single value but the downstream node expects a stream, Eino **boxes** the value into a single-element stream.
+- When a stream fans out to multiple downstream nodes, Eino **copies** the stream so each consumer gets an independent reader.
+- When multiple upstream nodes feed into a single node, Eino **merges** their streams.
+
+You never write this conversion code yourself. The framework resolves it at compile time by inspecting which paradigm each node implements and inserting adapters on the edges.
+
+## Working with StreamReader
+
+`schema.StreamReader[T]` is the consumer side of an Eino stream. It is read-once and must be closed exactly once.
+
+### Basic recv loop
+
+```go
+defer sr.Close() // always close, even after io.EOF
+
+for {
+    chunk, err := sr.Recv()
+    if errors.Is(err, io.EOF) {
+        break // normal end of stream
+    }
+    if err != nil {
+        return err // propagate real errors
+    }
+    process(chunk)
+}
+```
+
+<Warning>
+Always call `sr.Close()` after you finish reading, whether you reach `io.EOF` normally or exit early. Failing to close a stream leaks resources.
+</Warning>
+
+### Creating streams with Pipe
+
+Use `schema.Pipe[T]` when you need to produce a stream from a goroutine:
+
+```go
+sr, sw := schema.Pipe[string](3) // buffered capacity of 3
+
+go func() {
+    defer sw.Close()
+    for _, line := range lines {
+        if closed := sw.Send(line, nil); closed {
+            return // reader was closed early
+        }
+    }
+}()
+
+defer sr.Close()
+for {
+    chunk, err := sr.Recv()
+    if errors.Is(err, io.EOF) {
+        break
+    }
+    fmt.Println(chunk)
+}
+```
+
+### Copying a stream for multiple consumers
+
+A `StreamReader` can only be read by one goroutine. If two or more pipeline branches need the same stream, call `Copy` **before** any `Recv`. The original reader becomes unusable after `Copy`.
+
+```go
+copies := sr.Copy(2)
+sr1, sr2 := copies[0], copies[1]
+defer sr1.Close()
+defer sr2.Close()
+
+// sr1 and sr2 independently receive all elements of the original stream
+```
+
+The framework calls `Copy` automatically when a stream fans out to multiple nodes in a graph. You only need to call it directly when working with streams outside of the graph execution engine.
+
+### Filtering chunks with StreamReaderWithConvert
+
+```go
+filtered := schema.StreamReaderWithConvert(sr, func(chunk string) (string, error) {
+    if len(chunk) == 0 {
+        return "", schema.ErrNoValue // skip empty chunks
+    }
+    return strings.ToUpper(chunk), nil
+})
+defer filtered.Close()
+```
+
+Returning `schema.ErrNoValue` from the convert function drops that chunk silently and reads the next one.
+
+## Implementing streaming in a Lambda node
+
+When you write a Lambda that should produce real streaming output, use `StreamableLambda` or `TransformableLambda` rather than `InvokableLambda`. The framework will use the stream implementation when the caller invokes `Stream` or `Transform`, and will automatically concatenate it when the caller uses `Invoke` or `Collect`.
+
+<Tabs>
+  <Tab title="StreamableLambda">
+
+```go
+streamFn := compose.StreamableLambda(
+    func(ctx context.Context, prompt string) (*schema.StreamReader[string], error) {
+        sr, sw := schema.Pipe[string](10)
+        go func() {
+            defer sw.Close()
+            for _, token := range generateTokens(prompt) {
+                sw.Send(token, nil)
+            }
+        }()
+        return sr, nil
+    },
+)
+
+graph.AddLambdaNode("generate", streamFn)
+```
+
+  </Tab>
+  <Tab title="TransformableLambda">
+
+```go
+transformFn := compose.TransformableLambda(
+    func(ctx context.Context, in *schema.StreamReader[string]) (*schema.StreamReader[string], error) {
+        out, outW := schema.Pipe[string](10)
+        go func() {
+            defer outW.Close()
+            defer in.Close()
+            for {
+                chunk, err := in.Recv()
+                if errors.Is(err, io.EOF) {
+                    break
+                }
+                if err != nil {
+                    outW.Send("", err)
+                    return
+                }
+                outW.Send(strings.ToUpper(chunk), nil)
+            }
+        }()
+        return out, nil
+    },
+)
+
+graph.AddLambdaNode("uppercase", transformFn)
+```
+
+  </Tab>
+</Tabs>
+
+## Automatic paradigm fallback
+
+When a component only implements one paradigm, the framework derives the others automatically:
+
+| Implemented | Invoke derived by | Stream derived by | Collect derived by | Transform derived by |
+|---|---|---|---|---|
+| `Invoke` only | — | boxing output | concatenating input | both |
+| `Stream` only | concatenating output | — | concat in + concat out | concat input |
+| `Collect` only | boxing input | box in + box out | — | box output |
+| `Transform` only | concat in + concat out | concat input | concat output | — |
+
+This means you can always call any of the four methods on a compiled `Runnable`, regardless of which paradigms the individual nodes implement.
+
+<CardGroup cols={2}>
+  <Card title="Graph" href="/composition/graph">
+    Build graphs with explicit edges and conditional branches
+  </Card>
+  <Card title="Chain" href="/composition/chain">
+    Sequential pipelines with a fluent builder API
+  </Card>
+  <Card title="Workflow" href="/composition/workflow">
+    Declarative dependency and field-mapping approach
+  </Card>
+  <Card title="Stream API" href="/api/stream">
+    StreamReader, StreamWriter, Pipe, and MergeStreamReaders reference
+  </Card>
+</CardGroup>

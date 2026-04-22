@@ -1,0 +1,212 @@
+---
+title: "Human-in-the-loop with interrupt and resume"
+description: "Pause agent execution for human review, approval, or input, then resume from a checkpoint using Eino's interrupt and resume mechanism."
+---
+
+Eino's interrupt/resume system lets any agent or tool pause mid-execution, persist its state to a checkpoint store, and continue from exactly where it left off after a human provides input or approval. The framework handles state serialization, checkpoint routing, and the resume handshake — you only need to detect the interrupt event, collect human input, and call `Resume`.
+
+## How interruption works
+
+An agent signals an interrupt by emitting an `AgentEvent` whose `Action.Interrupted` field is non-nil. The `Runner` intercepts this event, saves a checkpoint (if a `CheckPointStore` is configured), and forwards the event to the caller.
+
+The `InterruptInfo` struct describes the interrupt:
+
+```go
+type InterruptInfo struct {
+    // Data is user-facing information supplied by the agent that describes
+    // the reason for the interrupt (e.g. a confirmation prompt, a list of
+    // pending actions, or a structured approval request).
+    Data any
+
+    // InterruptContexts provides a structured view of the interrupt chain.
+    // Each context represents one level of the agent hierarchy that was interrupted.
+    InterruptContexts []*InterruptCtx
+}
+```
+
+`InterruptCtx` (an alias for `core.InterruptCtx`) carries the ID and address of each interrupted component, letting you identify exactly which agent or tool triggered the pause.
+
+## Emitting an interrupt from an agent
+
+Inside a custom agent implementation, call `adk.Interrupt` to pause execution:
+
+```go
+// Interrupt pauses the agent without saving internal state.
+// info is the user-facing payload (string, struct, etc.).
+event := adk.Interrupt(ctx, map[string]any{
+    "prompt": "The agent wants to delete 3 files. Approve?",
+    "files":  pendingDeletions,
+})
+generator.Send(event)
+```
+
+If your agent has internal state that must survive the pause, use `StatefulInterrupt`:
+
+```go
+// StatefulInterrupt saves state alongside the interrupt so it can be
+// restored when the agent resumes.
+event := adk.StatefulInterrupt(ctx, "Awaiting human approval", myAgentState)
+generator.Send(event)
+```
+
+For composite agents that coordinate sub-agents, use `CompositeInterrupt` to merge child interrupt signals into a single parent interrupt:
+
+```go
+// CompositeInterrupt combines interrupts from sub-agents.
+event := adk.CompositeInterrupt(ctx, parentInfo, parentState, subInterruptSignal1, subInterruptSignal2)
+generator.Send(event)
+```
+
+`ChatModelAgent` calls `CompositeInterrupt` automatically when a sub-agent tool raises an interrupt, so you usually only need `Interrupt` or `StatefulInterrupt` in leaf agents.
+
+## Detecting an interrupt in the event stream
+
+Check `event.Action.Interrupted` in the event loop:
+
+```go
+runner := adk.NewRunner(ctx, adk.RunnerConfig{
+    Agent:           agent,
+    CheckPointStore: myCheckpointStore,
+    EnableStreaming:  true,
+})
+
+iter := runner.Query(ctx, "Please review and then delete the old log files.")
+
+const checkpointKey = "session-001"
+
+for {
+    event, ok := iter.Next()
+    if !ok {
+        break
+    }
+
+    if event.Err != nil {
+        log.Printf("error: %v", event.Err)
+        break
+    }
+
+    if event.Action != nil && event.Action.Interrupted != nil {
+        info := event.Action.Interrupted
+
+        // Show the interrupt payload to the human.
+        fmt.Printf("Agent paused: %v\n", info.Data)
+
+        // The checkpoint has already been saved by Runner at this point.
+        // Collect human input and resume later.
+        humanDecision := collectHumanInput()
+        resumeFromCheckpoint(ctx, runner, checkpointKey, humanDecision)
+        break
+    }
+
+    if event.Output != nil && event.Output.MessageOutput != nil {
+        msg, _ := event.Output.MessageOutput.GetMessage()
+        fmt.Println(msg.Content)
+    }
+}
+```
+
+## Resuming execution
+
+Call `runner.Resume` to restart from a saved checkpoint. The runner loads the serialized state from the `CheckPointStore` and hands it back to the agent's `Resume` method.
+
+```go
+// Resume uses the "implicit resume all" strategy: every interrupted component
+// proceeds without receiving specific resume data.
+iter, err := runner.Resume(ctx, checkpointKey)
+if err != nil {
+    log.Fatal(err)
+}
+// Consume the resumed event stream the same way as the original run.
+```
+
+To provide specific data to targeted interrupt points, use `ResumeWithParams`:
+
+```go
+iter, err := runner.ResumeWithParams(ctx, checkpointKey, &adk.ResumeParams{
+    // The key is the address of the interrupted component.
+    // The value is resume data for that component.
+    Targets: map[string]any{
+        interruptCtx.ID: &adk.ChatModelAgentResumeData{
+            HistoryModifier: func(ctx context.Context, history []adk.Message) []adk.Message {
+                // Append the human's decision to the conversation history
+                // so the model sees it on the next turn.
+                return append(history, schema.UserMessage("Approved. Proceed."))
+            },
+        },
+    },
+})
+```
+
+### ResumeInfo
+
+Internally, `Resume` reconstructs a `ResumeInfo` that the agent receives:
+
+```go
+type ResumeInfo struct {
+    // EnableStreaming mirrors the original run's streaming setting.
+    EnableStreaming bool
+
+    // WasInterrupted is true when the agent was the source of an interrupt.
+    WasInterrupted bool
+
+    // InterruptState is the agent's serialized internal state (if StatefulInterrupt was used).
+    InterruptState any
+
+    // IsResumeTarget is true when this agent was explicitly targeted by ResumeWithParams.
+    IsResumeTarget bool
+
+    // ResumeData is the caller-supplied data for this agent (from ResumeWithParams.Targets).
+    ResumeData any
+}
+```
+
+## The full interrupt/resume pattern
+
+<Steps>
+  <Step title="Configure a CheckPointStore">
+    Pass a `CheckPointStore` to `RunnerConfig`. Without it, `Runner.Resume` returns an error. The store receives the checkpoint key and serialized state bytes.
+
+    ```go
+    runner := adk.NewRunner(ctx, adk.RunnerConfig{
+        Agent:           agent,
+        CheckPointStore: redisCheckpointStore,
+    })
+    ```
+  </Step>
+  <Step title="Run the agent">
+    Call `runner.Query` or `runner.Run`. Provide a stable checkpoint key using `adk.WithCheckPointID`:
+
+    ```go
+    iter := runner.Query(ctx, "Summarize and then publish the report.",
+        adk.WithCheckPointID("run-42"))
+    ```
+  </Step>
+  <Step title="Detect the interrupt">
+    Consume the event stream until you see `event.Action.Interrupted != nil`. The `Runner` has already saved the checkpoint before forwarding the event to you.
+  </Step>
+  <Step title="Collect human input">
+    Present `InterruptInfo.Data` to the human. Wait for their response — this can be synchronous or asynchronous (e.g. a webhook, a UI interaction, or a message queue).
+  </Step>
+  <Step title="Resume">
+    Call `runner.Resume` or `runner.ResumeWithParams` with the checkpoint key. The agent reloads its state and continues from the point of interruption.
+
+    ```go
+    iter, err := runner.Resume(ctx, "run-42")
+    ```
+  </Step>
+</Steps>
+
+## Nested agent interrupts (CompositeInterrupt)
+
+When an agent is wrapped as an `AgentTool`, its `Interrupted` action is the one action that does cross the boundary. The wrapping agent's tool runner calls `CompositeInterrupt` automatically, merging the sub-agent's interrupt signal into a single interrupt that propagates up the agent hierarchy.
+
+This means a deeply nested sub-agent can pause the entire pipeline, and `ResumeWithParams` can target it precisely by address. The intermediate agents act as conduits: they re-interrupt when a child re-interrupts, and proceed normally when all children proceed.
+
+<CardGroup cols={2}>
+  <Card title="Observability and checkpoints" href="/observability/checkpoints">
+    Learn how to implement a CheckPointStore and inspect persisted state.
+  </Card>
+  <Card title="ChatModelAgent" href="/adk/chat-model-agent">
+    Understand the agent execution model that interrupt/resume builds on.
+  </Card>
+</CardGroup>

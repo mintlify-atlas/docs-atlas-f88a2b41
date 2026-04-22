@@ -1,0 +1,346 @@
+---
+title: "StreamReader API: receiving and copying streams"
+description: "Reference for schema.StreamReader[T] — receive chunks with Recv, fan-out with Copy, merge multiple sources, and convert element types mid-stream."
+---
+
+`schema.StreamReader[T]` is the consumer interface for every stream in Eino. Graph nodes, `Runnable.Stream`, and `Runnable.Transform` all return a `*StreamReader[T]`. The reader is **read-once**: only one goroutine should call `Recv`, and `Close` must be called exactly once, even if you break out of the receive loop early. When you need two or more independent consumers of the same stream, call `Copy` before the first `Recv`.
+
+---
+
+## StreamReader[T]
+
+```go
+type StreamReader[T any] struct { /* unexported */ }
+```
+
+`StreamReader` is created by `Pipe`, `StreamReaderFromArray`, `MergeStreamReaders`, `MergeNamedStreamReaders`, or `StreamReaderWithConvert`. You do not construct one directly.
+
+---
+
+## Recv
+
+```go
+func (sr *StreamReader[T]) Recv() (T, error)
+```
+
+Returns the next chunk from the stream. When the stream is exhausted, `Recv` returns the zero value of `T` and `io.EOF`. Any other error indicates a failure in an upstream node or the underlying transport.
+
+<ResponseField name="chunk" type="T">
+  The next typed value from the stream.
+</ResponseField>
+
+<ResponseField name="err" type="error">
+  `io.EOF` when the stream is done. Any other non-nil value is a real error.
+</ResponseField>
+
+<Warning>
+  Always check for `io.EOF` with `errors.Is(err, io.EOF)`, not `err == io.EOF`. Wrapped EOF values are common inside multi-stream readers.
+</Warning>
+
+### Standard receive loop
+
+```go
+defer sr.Close()
+
+for {
+    chunk, err := sr.Recv()
+    if errors.Is(err, io.EOF) {
+        break
+    }
+    if err != nil {
+        return err
+    }
+    process(chunk)
+}
+```
+
+---
+
+## Close
+
+```go
+func (sr *StreamReader[T]) Close()
+```
+
+Releases the resources associated with the stream. You must call `Close` exactly once — typically via `defer` immediately after obtaining the reader. Calling `Close` after `io.EOF` is safe and required; the underlying channel needs to be signalled even when the stream was fully consumed.
+
+<Note>
+  If you call `Copy` before reading, call `Close` on each child reader rather than on the original (which becomes unusable after `Copy`).
+</Note>
+
+```go
+sr, err := runnable.Stream(ctx, input)
+if err != nil {
+    return err
+}
+defer sr.Close() // always close, even after io.EOF
+```
+
+---
+
+## Copy
+
+```go
+func (sr *StreamReader[T]) Copy(n int) []*StreamReader[T]
+```
+
+Creates `n` independent readers that each receive every element of the original stream. The original reader becomes **unusable** after `Copy`. All `n` returned readers must each be closed by the caller.
+
+This is the correct way to fan-out a single stream to multiple consumers — for example, to feed the same token stream to both a callback handler and the next graph node.
+
+<ParamField path="n" type="int" required>
+  Number of independent readers to create. If `n < 2`, the original reader is returned unchanged.
+</ParamField>
+
+<ResponseField name="readers" type="[]*StreamReader[T]">
+  Slice of `n` readers, each capable of independently reading every element of the original stream.
+</ResponseField>
+
+```go
+copies := sr.Copy(2)
+sr1, sr2 := copies[0], copies[1]
+defer sr1.Close()
+defer sr2.Close()
+
+// sr1 and sr2 independently yield every chunk.
+go func() {
+    for {
+        chunk, err := sr1.Recv()
+        if errors.Is(err, io.EOF) { return }
+        logChunk(chunk)
+    }
+}()
+
+for {
+    chunk, err := sr2.Recv()
+    if errors.Is(err, io.EOF) { break }
+    if err != nil { return err }
+    display(chunk)
+}
+```
+
+---
+
+## SetAutomaticClose
+
+```go
+func (sr *StreamReader[T]) SetAutomaticClose()
+```
+
+Configures the reader to call `Close` automatically when it is garbage-collected. This is a convenience for cases where explicit lifetime management is impractical, such as in test helpers or fire-and-forget scenarios.
+
+<Warning>
+  `SetAutomaticClose` is not concurrency-safe. Call it once, immediately after obtaining the reader, before passing it to any goroutine.
+</Warning>
+
+```go
+sr := schema.StreamReaderFromArray([]string{"a", "b", "c"})
+sr.SetAutomaticClose()
+// No need to defer sr.Close() — GC will handle it.
+```
+
+---
+
+## StreamReaderFromArray
+
+```go
+func StreamReaderFromArray[T any](arr []T) *StreamReader[T]
+```
+
+Wraps a slice as a `StreamReader`. All elements are available immediately without blocking. This is the standard way to create a stream in tests or to wrap a known slice for use with `Collect` or `Transform`.
+
+<ParamField path="arr" type="[]T" required>
+  The elements to stream. The slice is not copied; do not modify it after calling this function.
+</ParamField>
+
+```go
+sr := schema.StreamReaderFromArray([]string{"Hello", " ", "world"})
+defer sr.Close()
+
+for {
+    chunk, err := sr.Recv()
+    if errors.Is(err, io.EOF) { break }
+    fmt.Print(chunk)
+}
+// Output: Hello  world
+```
+
+---
+
+## Pipe
+
+```go
+func Pipe[T any](cap int) (*StreamReader[T], *StreamWriter[T])
+```
+
+Creates a buffered channel-backed stream. The `StreamWriter[T]` is the send side; the `StreamReader[T]` is the receive side. Use `Pipe` when you need to produce stream data from a goroutine.
+
+<ParamField path="cap" type="int" required>
+  Buffer capacity. A capacity of `0` makes sends block until the reader calls `Recv`.
+</ParamField>
+
+```go
+sr, sw := schema.Pipe[string](10)
+
+go func() {
+    defer sw.Close()
+    for _, token := range tokens {
+        sw.Send(token, nil)
+    }
+}()
+
+defer sr.Close()
+for {
+    chunk, err := sr.Recv()
+    if errors.Is(err, io.EOF) { break }
+    if err != nil { return err }
+    fmt.Print(chunk)
+}
+```
+
+---
+
+## MergeStreamReaders
+
+```go
+func MergeStreamReaders[T any](srs []*StreamReader[T]) *StreamReader[T]
+```
+
+Fans in multiple readers into a single reader. Chunks arrive in non-deterministic order (whichever source produces them first). The merged reader reaches `io.EOF` only after every source has been exhausted.
+
+<ParamField path="srs" type="[]*StreamReader[T]" required>
+  Readers to merge. Returns `nil` if the slice is empty.
+</ParamField>
+
+```go
+merged := schema.MergeStreamReaders([]*schema.StreamReader[string]{srA, srB})
+defer merged.Close()
+```
+
+---
+
+## MergeNamedStreamReaders
+
+```go
+func MergeNamedStreamReaders[T any](srs map[string]*StreamReader[T]) *StreamReader[T]
+```
+
+Like `MergeStreamReaders`, but emits a `*SourceEOF` error (not `io.EOF`) each time an individual source stream ends. This lets you detect exactly which source finished. Use `GetSourceName(err)` to extract the name. The merged reader itself signals `io.EOF` only after all sources are done.
+
+<ParamField path="srs" type="map[string]*StreamReader[T]" required>
+  Map from human-readable source name to reader.
+</ParamField>
+
+```go
+merged := schema.MergeNamedStreamReaders(map[string]*schema.StreamReader[string]{
+    "agent_a": srA,
+    "agent_b": srB,
+})
+defer merged.Close()
+
+for {
+    chunk, err := merged.Recv()
+    if errors.Is(err, io.EOF) {
+        break
+    }
+    if name, ok := schema.GetSourceName(err); ok {
+        fmt.Printf("%s finished\n", name)
+        continue
+    }
+    if err != nil {
+        return err
+    }
+    process(chunk)
+}
+```
+
+---
+
+## StreamReaderWithConvert
+
+```go
+func StreamReaderWithConvert[T, D any](
+    sr *StreamReader[T],
+    convert func(T) (D, error),
+    opts ...ConvertOption,
+) *StreamReader[D]
+```
+
+Wraps `sr` with a type-conversion function, producing a new reader of type `D`. The original reader must not be used after this call.
+
+To **skip** an element, return `schema.ErrNoValue` from `convert` — the element is silently dropped and the next one is read.
+
+<ParamField path="sr" type="*StreamReader[T]" required>
+  The source reader. Ownership transfers to the returned reader.
+</ParamField>
+
+<ParamField path="convert" type="func(T) (D, error)" required>
+  Applied to each element. Return `schema.ErrNoValue` to skip an element.
+</ParamField>
+
+<ParamField path="opts" type="...ConvertOption">
+  Optional. `WithErrWrapper(wrapper)` lets you handle or suppress non-EOF errors from the underlying stream.
+</ParamField>
+
+```go
+intReader := schema.StreamReaderFromArray([]int{0, 1, 2, 3})
+
+strReader := schema.StreamReaderWithConvert(intReader,
+    func(i int) (string, error) {
+        if i == 0 {
+            return "", schema.ErrNoValue // skip zero
+        }
+        return fmt.Sprintf("val_%d", i), nil
+    },
+)
+defer strReader.Close()
+
+// Recv yields "val_1", "val_2", "val_3"
+```
+
+---
+
+## Single-read limitation
+
+A `StreamReader` can only be read by one goroutine and must be read once. Attempting to share a reader across goroutines or call `Recv` from two places produces undefined results.
+
+If you need multiple consumers:
+
+1. Call `Copy(n)` before any `Recv`.
+2. Give each returned reader to one goroutine.
+3. Close each reader independently.
+
+```go
+copies := sr.Copy(3)
+for i, c := range copies {
+    c := c
+    go func(id int) {
+        defer c.Close()
+        for {
+            chunk, err := c.Recv()
+            if errors.Is(err, io.EOF) { return }
+            handleChunk(id, chunk)
+        }
+    }(i)
+}
+```
+
+---
+
+## ErrNoValue
+
+```go
+var ErrNoValue = errors.New("no value")
+```
+
+Sentinel returned by the `convert` function passed to `StreamReaderWithConvert` to silently skip an element. Do not use this error in any other context.
+
+---
+
+## ErrRecvAfterClosed
+
+```go
+var ErrRecvAfterClosed = errors.New("recv after stream closed")
+```
+
+Returned when `Recv` is called on a child reader (produced by `Copy`) after that reader has been closed. This should not occur in correct application code.

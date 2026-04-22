@@ -1,0 +1,164 @@
+---
+title: "Composition: graphs, chains, and workflows"
+description: "Wire Eino components into graphs, chains, and workflows that compile to a Runnable with four execution modes: Invoke, Stream, Collect, and Transform."
+---
+
+Components define what individual pieces can do. Composition defines how they connect. The `compose` package gives you three builders — `Graph`, `Chain`, and `Workflow` — that all compile down to the same `Runnable[I, O]` interface. Once compiled, a runnable can be invoked like a function, used as a streaming source, or even exposed as a tool for an agent to call.
+
+## Graph
+
+`Graph` is the most flexible builder. You add nodes individually, then declare edges between them. The result is a directed graph that the framework executes using either a DAG engine (no cycles, all predecessors must complete) or a Pregel engine (cycles allowed, any predecessor triggers the node).
+
+```go
+graph := compose.NewGraph[*Input, *Output]()
+
+graph.AddLambdaNode("validate", validateFn)
+graph.AddChatModelNode("generate", chatModel)
+graph.AddLambdaNode("format", formatFn)
+
+graph.AddEdge(compose.START, "validate")
+graph.AddEdge("validate", "generate")
+graph.AddEdge("generate", "format")
+graph.AddEdge("format", compose.END)
+
+runnable, _ := graph.Compile(ctx)
+result, _ := runnable.Invoke(ctx, input)
+```
+
+### START and END
+
+Every graph has two reserved node keys:
+
+```go
+const START = "start"
+const END   = "end"
+```
+
+Your first edge must originate from `START` and your last edge must terminate at `END`. These are not real nodes — they are sentinels that tell the engine where execution begins and where output is collected.
+
+### Node trigger modes
+
+The `NodeTriggerMode` controls when a node fires:
+
+| Mode | Behaviour |
+|---|---|
+| `AllPredecessor` | Node runs only after every predecessor has completed. Used by DAG and Workflow. |
+| `AnyPredecessor` | Node runs as soon as any predecessor in the current super-step completes. Used by Pregel; allows cycles. |
+
+## Chain
+
+`Chain` is a sequential builder that uses method chaining. Under the hood it is a `Graph` — the nodes are wired in the order you append them.
+
+```go
+chain := compose.NewChain[string, string]()
+chain.
+    AppendChatTemplate(template).
+    AppendChatModel(chatModel).
+    AppendLambda(postProcess)
+
+runnable, _ := chain.Compile(ctx)
+result, _ := runnable.Invoke(ctx, "Hello")
+```
+
+Use `Chain` when your data flow is strictly sequential and you want a concise builder pattern. Switch to `Graph` when you need branching, fan-out, fan-in, or cycles.
+
+## Workflow
+
+`Workflow` is a declarative alternative to `Graph`. Instead of calling `AddEdge` to connect nodes, you declare field-level dependencies between nodes. The framework infers the execution order automatically.
+
+```go
+wf := compose.NewWorkflow[*Input, *Output]()
+
+validateNode := wf.AddLambdaNode("validate", validateFn)
+generateNode := wf.AddChatModelNode("generate", chatModel)
+
+// generate depends on the output of validate
+generateNode.AddInput(validateNode)
+
+runnable, _ := wf.Compile(ctx)
+```
+
+<Note>
+Workflow uses `AllPredecessor` trigger mode and does not support cycles.
+</Note>
+
+## The Runnable interface
+
+All three builders compile to `Runnable[I, O]`, which exposes four execution modes:
+
+```go
+type Runnable[I, O any] interface {
+    // Invoke: one input → one output (blocking)
+    Invoke(ctx context.Context, input I, opts ...Option) (output O, err error)
+
+    // Stream: one input → streaming output chunks
+    Stream(ctx context.Context, input I, opts ...Option) (output *schema.StreamReader[O], err error)
+
+    // Collect: streaming input chunks → one output (blocking)
+    Collect(ctx context.Context, input *schema.StreamReader[I], opts ...Option) (output O, err error)
+
+    // Transform: streaming input chunks → streaming output chunks
+    Transform(ctx context.Context, input *schema.StreamReader[I], opts ...Option) (output *schema.StreamReader[O], err error)
+}
+```
+
+You only need to implement the modes that make sense for each component. Eino automatically handles conversion between modes — for example, if a node only implements `Stream`, you can still call `Invoke` on the compiled runnable and the framework will concatenate the stream for you.
+
+| Mode | Use when |
+|---|---|
+| `Invoke` | You need a single result and latency allows waiting for completion |
+| `Stream` | You want to display output incrementally as the model generates it |
+| `Collect` | Your input arrives as a stream but your downstream logic needs a single value |
+| `Transform` | Both input and output are streams; maximum throughput with minimal buffering |
+
+## Exposing a graph as a tool
+
+A compiled graph can be wrapped as a `tool.InvokableTool` and given to an agent. This bridges deterministic pipelines with autonomous agent behavior.
+
+```go
+// graphtool is available in the eino-examples repository:
+// github.com/cloudwego/eino-examples/adk/common/tool/graphtool
+graphTool, _ := graphtool.NewInvokableGraphTool(graph, "data_pipeline", "Process and validate data")
+
+agent, _ := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
+    Model: chatModel,
+    ToolsConfig: adk.ToolsConfig{
+        ToolsNodeConfig: compose.ToolsNodeConfig{
+            Tools: []tool.BaseTool{graphTool},
+        },
+    },
+})
+```
+
+The agent decides when to call the pipeline, while the pipeline itself enforces its own deterministic execution order.
+
+## Stream processing
+
+Eino automatically handles streaming throughout composition: concatenating, boxing, merging, and copying streams as data flows between nodes. You do not need to write any stream glue code between nodes.
+
+<Tip>
+See the [streaming guide](/composition/streaming) for a full explanation of how the framework propagates streams through graphs and what stream operations are available.
+</Tip>
+
+## Learn more
+
+<CardGroup cols={3}>
+  <Card title="Graph" href="/composition/graph">
+    Detailed guide to building graphs with branches, fan-out, cycles, and state.
+  </Card>
+  <Card title="Chain" href="/composition/chain">
+    Sequential builder pattern with parallel and branch helpers.
+  </Card>
+  <Card title="Workflow" href="/composition/workflow">
+    Declarative dependency-based composition without explicit edges.
+  </Card>
+  <Card title="Streaming" href="/composition/streaming">
+    Stream propagation, concatenation, fan-out, and the four execution modes.
+  </Card>
+  <Card title="Graph API" href="/api/graph">
+    Full reference for NewGraph, AddNode, AddEdge, Compile, and GraphBranch.
+  </Card>
+  <Card title="Runnable API" href="/api/runnable">
+    Full reference for the Runnable interface and execution options.
+  </Card>
+</CardGroup>

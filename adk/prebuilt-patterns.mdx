@@ -1,0 +1,298 @@
+---
+title: "Prebuilt agent patterns: DeepAgent, Supervisor, Plan-Execute"
+description: "Use Eino's prebuilt agent patterns — DeepAgent, Supervisor, and Plan-Execute — to build multi-agent systems without writing coordination logic from scratch."
+---
+
+Eino ships three prebuilt multi-agent patterns that cover the most common agent topologies. Each pattern is a fully configured `ResumableAgent` that you can run with the standard `Runner` API. Pick the pattern that matches your problem's structure, configure it with your models and tools, and start running tasks.
+
+<Tabs>
+  <Tab title="DeepAgent">
+    ## DeepAgent
+
+    DeepAgent is an orchestration agent designed for complex, multi-step tasks. It maintains an internal todo list, breaks down the user's request into actionable steps, delegates sub-tasks to specialized sub-agents, and tracks progress until the task is complete.
+
+    **Use DeepAgent when:**
+    - The task requires multiple rounds of planning and action.
+    - You need to delegate different kinds of work to specialized agents.
+    - You want built-in support for filesystem operations and shell commands.
+
+    ### Configuration
+
+    ```go
+    import (
+        "github.com/cloudwego/eino/adk"
+        "github.com/cloudwego/eino/adk/prebuilt/deep"
+        "github.com/cloudwego/eino/compose"
+        "github.com/cloudwego/eino/components/tool"
+    )
+
+    deepAgent, err := deep.New(ctx, &deep.Config{
+        // Name and Description identify the agent when used as a sub-agent.
+        Name:        "deep_agent",
+        Description: "An orchestration agent for complex multi-step tasks.",
+
+        // ChatModel is used for reasoning and task execution.
+        // Must support model.WithTools.
+        ChatModel: chatModel,
+
+        // Instruction overrides the built-in system prompt.
+        // Leave empty to use the default prompt, which includes general
+        // assistant guidelines, security policies, and tool usage rules.
+        Instruction: "",
+
+        // SubAgents are specialized agents available for delegation.
+        SubAgents: []adk.Agent{researchAgent, codeAgent},
+
+        // ToolsConfig provides tools directly available to the DeepAgent.
+        ToolsConfig: adk.ToolsConfig{
+            ToolsNodeConfig: compose.ToolsNodeConfig{
+                Tools: []tool.BaseTool{shellTool, webSearchTool},
+            },
+        },
+
+        // MaxIteration caps the ReAct loop. 0 uses the default.
+        MaxIteration: 30,
+
+        // Backend enables built-in filesystem tools (read_file, write_file,
+        // edit_file, glob, grep) when set.
+        Backend: myFilesystemBackend,
+
+        // Shell enables a shell execution tool. Mutually exclusive with StreamingShell.
+        Shell: myShell,
+    })
+    ```
+
+    ### Running DeepAgent
+
+    ```go
+    runner := adk.NewRunner(ctx, adk.RunnerConfig{
+        Agent:           deepAgent,
+        EnableStreaming:  true,
+        CheckPointStore: myStore, // optional: enables interrupt/resume
+    })
+
+    iter := runner.Query(ctx, "Analyze the sales data in report.csv and generate a summary chart")
+
+    for {
+        event, ok := iter.Next()
+        if !ok {
+            break
+        }
+        if event.Output != nil && event.Output.MessageOutput != nil {
+            msg, _ := event.Output.MessageOutput.GetMessage()
+            fmt.Printf("[%s] %s\n", event.AgentName, msg.Content)
+        }
+    }
+    ```
+
+    ### Key Config fields
+
+    | Field | Description |
+    |---|---|
+    | `ChatModel` | Required. The model for reasoning. |
+    | `SubAgents` | Specialized agents for delegation. |
+    | `ToolsConfig` | Tools directly available to the DeepAgent. |
+    | `Backend` | Enables filesystem tools when set. |
+    | `Shell` / `StreamingShell` | Enables a shell tool (mutually exclusive). |
+    | `WithoutWriteTodos` | Disable the built-in todo tracking tool. |
+    | `WithoutGeneralSubAgent` | Disable the built-in general-purpose sub-agent. |
+    | `MaxIteration` | Cap on the internal ReAct loop iterations. |
+  </Tab>
+  <Tab title="Supervisor">
+    ## Supervisor pattern
+
+    The supervisor pattern designates one agent as the coordinator and gives it control over a set of specialized sub-agents. Sub-agents can only communicate with the supervisor — not with each other directly. The supervisor decides which sub-agent to engage and synthesizes their outputs into a final response.
+
+    **Use the Supervisor pattern when:**
+    - Tasks have a clear division of responsibility between specialized agents.
+    - You want centralized control and a single decision-maker.
+    - You need unified tracing across all agents in a single trace root.
+
+    ### Configuration
+
+    ```go
+    import (
+        "github.com/cloudwego/eino/adk"
+        "github.com/cloudwego/eino/adk/prebuilt/supervisor"
+    )
+
+    // Build the supervisor agent. Its Name is used for routing.
+    supervisorAgent, _ := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
+        Name:        "supervisor",
+        Description: "Coordinates research and writing tasks.",
+        Model:       supervisorModel,
+        Instruction: "You are a project manager. Delegate tasks to the appropriate specialist.",
+    })
+
+    // Build the sub-agents.
+    researchAgent, _ := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
+        Name:        "researcher",
+        Description: "Finds and summarizes information on any topic.",
+        Model:       researchModel,
+        ToolsConfig: adk.ToolsConfig{
+            ToolsNodeConfig: compose.ToolsNodeConfig{
+                Tools: []tool.BaseTool{webSearchTool},
+            },
+        },
+    })
+
+    writerAgent, _ := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
+        Name:        "writer",
+        Description: "Drafts polished text from research notes.",
+        Model:       writerModel,
+    })
+
+    // Wire everything together.
+    system, err := supervisor.New(ctx, &supervisor.Config{
+        Supervisor: supervisorAgent,
+        SubAgents:  []adk.Agent{researchAgent, writerAgent},
+    })
+    ```
+
+    ### How it works
+
+    `supervisor.New` wraps each sub-agent with a `DeterministicTransferConfig` that restricts the sub-agent's `TransferToAgent` actions to point only back to the supervisor. This prevents sub-agents from transferring control to each other or to an unrelated agent.
+
+    The returned agent is a `supervisorContainer` that provides a unified callback identity for tracing. All agents in the system share the same trace root, so observability tools see the entire multi-agent run as a single logical unit.
+
+    ### Running the Supervisor
+
+    ```go
+    runner := adk.NewRunner(ctx, adk.RunnerConfig{
+        Agent: system,
+    })
+
+    iter := runner.Query(ctx, "Research and then write a blog post about quantum computing.")
+    for {
+        event, ok := iter.Next()
+        if !ok {
+            break
+        }
+        if event.Output != nil && event.Output.MessageOutput != nil {
+            msg, _ := event.Output.MessageOutput.GetMessage()
+            fmt.Printf("[%s] %s\n", event.AgentName, msg.Content)
+        }
+    }
+    ```
+  </Tab>
+  <Tab title="Plan-Execute">
+    ## Plan-Execute pattern
+
+    The plan-execute pattern separates planning from execution. A planner agent generates a structured list of steps. An executor agent works through the steps one at a time. A replanner agent evaluates progress after each step and either revises the plan or declares the task complete.
+
+    **Use Plan-Execute when:**
+    - Tasks benefit from an explicit, inspectable plan before execution begins.
+    - You want the system to adapt its strategy based on intermediate results.
+    - Different models are better suited for planning versus execution.
+
+    ### Components
+
+    The `planexecute` package provides three constructors:
+
+    #### NewPlanner
+
+    Creates an agent that generates the initial plan. Configure it with either a model that outputs structured JSON directly, or a tool-calling model:
+
+    ```go
+    import "github.com/cloudwego/eino/adk/prebuilt/planexecute"
+
+    planner, err := planexecute.NewPlanner(ctx, &planexecute.PlannerConfig{
+        // Option 1: model pre-configured for structured output.
+        ChatModelWithFormattedOutput: structuredOutputModel,
+
+        // Option 2: tool-calling model (mutually exclusive with option 1).
+        ToolCallingChatModel: toolCallingModel,
+        ToolInfo:             &planexecute.PlanToolInfo, // use default plan schema
+    })
+    ```
+
+    #### NewExecutor
+
+    Creates an agent that executes one step of the plan at a time. It reads the current plan, executed steps, and user input from the shared session:
+
+    ```go
+    executor, err := planexecute.NewExecutor(ctx, &planexecute.ExecutorConfig{
+        Model: executorModel,
+        ToolsConfig: adk.ToolsConfig{
+            ToolsNodeConfig: compose.ToolsNodeConfig{
+                Tools: []tool.BaseTool{calculatorTool, webSearchTool},
+            },
+        },
+        MaxIterations: 10,
+    })
+    ```
+
+    #### NewReplanner
+
+    Creates an agent that reviews progress and either provides a final answer (via the `respond` tool) or generates a revised plan (via the `plan` tool):
+
+    ```go
+    replanner, err := planexecute.NewReplanner(ctx, &planexecute.ReplannerConfig{
+        ChatModel:   replannerModel, // must implement model.ToolCallingChatModel
+        PlanTool:    &planexecute.PlanToolInfo,
+        RespondTool: &planexecute.RespondToolInfo,
+    })
+    ```
+
+    ### Assembling the pipeline
+
+    Pass the three agents to `planexecute.New`. Internally this builds a `SequentialAgent` (planner → loop) where the loop runs executor and replanner up to `MaxIterations` times:
+
+    ```go
+    agent, err := planexecute.New(ctx, &planexecute.Config{
+        Planner:       planner,
+        Executor:      executor,
+        Replanner:     replanner,
+        MaxIterations: 10, // max execute-replan cycles
+    })
+
+    runner := adk.NewRunner(ctx, adk.RunnerConfig{Agent: agent})
+    iter := runner.Query(ctx, "Find the top 5 Python packages by downloads and summarize their use cases.")
+
+    for {
+        event, ok := iter.Next()
+        if !ok {
+            break
+        }
+        if event.Output != nil && event.Output.MessageOutput != nil {
+            msg, _ := event.Output.MessageOutput.GetMessage()
+            fmt.Printf("[%s] %s\n", event.AgentName, msg.Content)
+        }
+    }
+    ```
+
+    ### Session keys
+
+    The three agents coordinate through shared session values. You can read these in callbacks or custom middleware:
+
+    | Key | Type | Description |
+    |---|---|---|
+    | `planexecute.UserInputSessionKey` | `[]adk.Message` | The original user messages. |
+    | `planexecute.PlanSessionKey` | `planexecute.Plan` | The current plan. |
+    | `planexecute.ExecutedStepSessionKey` | `string` | The result of the most recent step. |
+    | `planexecute.ExecutedStepsSessionKey` | `[]planexecute.ExecutedStep` | All completed steps and their results. |
+  </Tab>
+</Tabs>
+
+## Choosing a pattern
+
+<Accordion title="When should I use DeepAgent?">
+  DeepAgent is best when you have a single complex task that requires multiple rounds of autonomous planning and action, and you want the agent to manage its own progress tracking. It is particularly well-suited for tasks that involve filesystem access, shell commands, or delegation to specialized sub-agents.
+</Accordion>
+
+<Accordion title="When should I use the Supervisor pattern?">
+  Use the Supervisor pattern when you have a fixed set of specialized agents and a clear division of responsibility. The supervisor provides centralized control and makes all routing decisions. It is a good fit when unified tracing and a predictable handoff structure matter.
+</Accordion>
+
+<Accordion title="When should I use Plan-Execute?">
+  Use Plan-Execute when the task benefits from an explicit, inspectable plan that you or the system can review before execution begins. The replanner loop allows the system to adapt its strategy based on intermediate results, making it useful for research or multi-step analysis tasks where the full set of steps is not known up front.
+</Accordion>
+
+<CardGroup cols={2}>
+  <Card title="Multi-agent coordination" href="/adk/multi-agent">
+    Learn how agent tools, transfer actions, and action scoping work under the hood.
+  </Card>
+  <Card title="Human-in-the-loop" href="/adk/human-in-the-loop">
+    Add interrupt/resume to any prebuilt pattern by configuring a CheckPointStore.
+  </Card>
+</CardGroup>

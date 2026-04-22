@@ -1,0 +1,273 @@
+---
+title: "Retriever API reference"
+description: "Complete reference for the Retriever interface, retrieval Options, schema.Document, and graph integration in the Eino Go LLM framework."
+---
+
+The `retriever` package defines the `Retriever` interface, which fetches the most relevant documents from a vector store or search backend for a given natural-language query. Retrievers are the read-side complement to `Indexer` and slot into RAG pipelines as a graph node or as standalone callers.
+
+## Interface
+
+### Retriever
+
+```go
+type Retriever interface {
+    Retrieve(ctx context.Context, query string, opts ...Option) ([]*schema.Document, error)
+}
+```
+
+#### Retrieve
+
+<ParamField path="ctx" type="context.Context" required>
+  Request context. Use it to carry deadlines, cancellation signals, and per-request metadata.
+</ParamField>
+
+<ParamField path="query" type="string" required>
+  A natural-language query string. When `Options.Embedding` is set, the implementation converts this string to a vector before searching the store. Use the same embedding model that was used at index time.
+</ParamField>
+
+<ParamField path="opts" type="...Option">
+  Zero or more call-time options that override the implementation's defaults for this request. See [Options](#options) below.
+</ParamField>
+
+<ResponseField name="[]*schema.Document" type="[]*schema.Document">
+  Matching documents ordered by relevance (most relevant first). The number of results is bounded by `Options.TopK`. Documents scoring below `Options.ScoreThreshold` are excluded entirely.
+</ResponseField>
+
+<ResponseField name="error" type="error">
+  Non-nil on backend errors, context cancellation, or configuration problems (e.g. a missing or mismatched embedder).
+</ResponseField>
+
+---
+
+## Options
+
+Call-time options let you tune retrieval behaviour per request without reconfiguring the client.
+
+### Option constructors
+
+<ParamField path="WithTopK(topK int)" type="Option">
+  Caps the number of documents returned. Defaults to the implementation's configured value.
+</ParamField>
+
+<ParamField path="WithScoreThreshold(threshold float64)" type="Option">
+  Excludes documents whose similarity score is below `threshold` (e.g. `0.5`). This is a filter, not a sort — documents that would otherwise rank highly are dropped if they fall below the threshold.
+</ParamField>
+
+<ParamField path="WithEmbedding(emb embedding.Embedder)" type="Option">
+  Overrides the embedder used to convert the query to a vector. Must be the same model family used at index time.
+</ParamField>
+
+<ParamField path="WithIndex(index string)" type="Option">
+  Selects the index or collection to search within. Semantics vary by backend (e.g. a Redis index name, a Weaviate class).
+</ParamField>
+
+<ParamField path="WithSubIndex(subIndex string)" type="Option">
+  Selects a sub-index or partition within the primary index.
+</ParamField>
+
+<ParamField path="WithDSLInfo(dsl map[string]any)" type="Option">
+  Passes backend-specific filter or query expressions. Structure and semantics are defined by the underlying store.
+</ParamField>
+
+### Options struct
+
+```go
+type Options struct {
+    Index          *string
+    SubIndex       *string
+    TopK           *int
+    ScoreThreshold *float64
+    Embedding      embedding.Embedder
+    DSLInfo        map[string]any
+}
+```
+
+Inside your `Retrieve` implementation, call `GetCommonOptions` to merge caller-provided options onto your defaults:
+
+```go
+func (r *MyRetriever) Retrieve(ctx context.Context, query string, opts ...retriever.Option) ([]*schema.Document, error) {
+    options := retriever.GetCommonOptions(&retriever.Options{TopK: &r.defaultTopK}, opts...)
+    // use options.TopK, options.ScoreThreshold, options.Embedding, etc.
+}
+```
+
+### Implementation-specific options
+
+Use `WrapImplSpecificOptFn` to expose backend-specific parameters alongside standard options:
+
+```go
+func WithNamespace(ns string) retriever.Option {
+    return retriever.WrapImplSpecificOptFn(func(o *MyOptions) {
+        o.Namespace = ns
+    })
+}
+```
+
+Retrieve them inside your implementation with `GetImplSpecificOptions`:
+
+```go
+myOpts := retriever.GetImplSpecificOptions(&MyOptions{Namespace: "default"}, opts...)
+```
+
+---
+
+## schema.Document
+
+`Document` is the data unit exchanged between `Loader`, `Transformer`, `Indexer`, and `Retriever` components. A `Retriever` returns a slice of documents ordered by relevance.
+
+```go
+type Document struct {
+    ID       string         `json:"id"`
+    Content  string         `json:"content"`
+    MetaData map[string]any `json:"meta_data"`
+}
+```
+
+<ResponseField name="ID" type="string">
+  A unique identifier assigned at index time. Useful for deduplication and provenance tracking.
+</ResponseField>
+
+<ResponseField name="Content" type="string">
+  The text content of the document chunk. This is the text the model ultimately sees.
+</ResponseField>
+
+<ResponseField name="MetaData" type="map[string]any">
+  An open metadata map. Eino manages well-known keys through typed accessor methods so you never need to reference raw key strings:
+
+  | Accessor | Description |
+  |---|---|
+  | `doc.Score()` / `doc.WithScore(score float64)` | Similarity score assigned by the retriever. |
+  | `doc.SubIndexes()` / `doc.WithSubIndexes([]string)` | Logical partitions the document belongs to. |
+  | `doc.DenseVector()` / `doc.WithDenseVector([]float64)` | Dense embedding vector. |
+  | `doc.SparseVector()` / `doc.WithSparseVector(map[int]float64)` | Sparse embedding vector. |
+  | `doc.DSLInfo()` / `doc.WithDSLInfo(map[string]any)` | Backend-specific filter metadata. |
+  | `doc.ExtraInfo()` / `doc.WithExtraInfo(string)` | Arbitrary extra string metadata. |
+</ResponseField>
+
+<Note>
+  When implementing a `Transformer`, preserve existing metadata and merge new keys rather than replacing `MetaData` outright, so provenance accumulated by earlier pipeline stages is not lost.
+</Note>
+
+---
+
+## Callback types
+
+Use `ConvCallbackInput` and `ConvCallbackOutput` to cast the raw `callbacks.CallbackInput` / `callbacks.CallbackOutput` interfaces into the typed retriever structs inside your callback handler.
+
+### CallbackInput
+
+```go
+type CallbackInput struct {
+    Query          string
+    TopK           int
+    Filter         string
+    ScoreThreshold *float64
+    Extra          map[string]any
+}
+```
+
+### CallbackOutput
+
+```go
+type CallbackOutput struct {
+    Docs  []*schema.Document
+    Extra map[string]any
+}
+```
+
+---
+
+## Graph integration
+
+Add a retriever to an Eino graph with `AddRetrieverNode`. The node accepts a `string` query and emits `[]*schema.Document`.
+
+```go
+import (
+    "context"
+
+    "github.com/cloudwego/eino/compose"
+    "github.com/cloudwego/eino/components/retriever"
+    // replace with your chosen backend
+    "github.com/cloudwego/eino-ext/components/retriever/redis"
+)
+
+func buildRAGGraph(ctx context.Context) {
+    ret, err := redis.NewRetriever(ctx, &redis.RetrieverConfig{
+        Address: "localhost:6379",
+        TopK:    5,
+    })
+    if err != nil {
+        panic(err)
+    }
+
+    graph := compose.NewGraph[string, []*schema.Document]()
+    graph.AddRetrieverNode("retriever", ret)
+}
+```
+
+You can also call `Retrieve` directly, outside of a graph:
+
+```go
+docs, err := ret.Retrieve(ctx, "what is eino?",
+    retriever.WithTopK(5),
+    retriever.WithScoreThreshold(0.6),
+)
+if err != nil {
+    panic(err)
+}
+
+for _, doc := range docs {
+    fmt.Printf("[%.2f] %s\n", doc.Score(), doc.Content)
+}
+```
+
+---
+
+## Implementing a custom retriever
+
+```go
+package myretriever
+
+import (
+    "context"
+
+    "github.com/cloudwego/eino/components/retriever"
+    "github.com/cloudwego/eino/schema"
+)
+
+type MyRetriever struct {
+    defaultTopK int
+    store       MyVectorStore
+}
+
+func (r *MyRetriever) Retrieve(ctx context.Context, query string, opts ...retriever.Option) ([]*schema.Document, error) {
+    options := retriever.GetCommonOptions(&retriever.Options{TopK: &r.defaultTopK}, opts...)
+
+    topK := 10
+    if options.TopK != nil {
+        topK = *options.TopK
+    }
+
+    rawDocs, err := r.store.Search(ctx, query, topK)
+    if err != nil {
+        return nil, err
+    }
+
+    docs := make([]*schema.Document, 0, len(rawDocs))
+    for _, d := range rawDocs {
+        doc := &schema.Document{
+            ID:       d.ID,
+            Content:  d.Text,
+            MetaData: make(map[string]any),
+        }
+        doc.WithScore(d.Score)
+
+        if options.ScoreThreshold != nil && d.Score < *options.ScoreThreshold {
+            continue
+        }
+        docs = append(docs, doc)
+    }
+
+    return docs, nil
+}
+```

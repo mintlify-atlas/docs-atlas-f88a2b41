@@ -1,0 +1,51 @@
+---
+title: "Eino architecture and key concepts"
+description: "Learn how Eino's three-layer architecture—Components, Composition, and ADK—works together to build production-ready LLM applications in Go."
+---
+
+Eino is a Go framework for building LLM applications. It draws inspiration from LangChain and Google ADK while staying true to Go idioms: explicit interfaces, static typing, and straightforward concurrency. Every Eino application is built from the same three layers, stacked on top of each other so that higher layers consume the abstractions defined below them.
+
+## The three layers
+
+<CardGroup cols={3}>
+  <Card title="Components" icon="puzzle-piece" href="/concepts/components">
+    Typed interfaces for AI primitives: chat models, tools, retrievers, embedders, prompts, indexers, and document transformers. Official implementations live in [eino-ext](https://github.com/cloudwego/eino-ext); you can also write your own.
+  </Card>
+  <Card title="Composition" icon="diagram-project" href="/concepts/composition">
+    The `compose` package lets you wire components together into graphs, chains, and workflows. A compiled graph becomes a `Runnable` that supports invoke, stream, collect, and transform execution modes.
+  </Card>
+  <Card title="ADK" icon="robot" href="/concepts/agents">
+    The Agent Development Kit sits on top of composition. It provides the `Agent` interface, a `Runner` entry point, multi-agent coordination, interrupt/resume for human-in-the-loop flows, and ready-to-use agent patterns like `ChatModelAgent`.
+  </Card>
+</CardGroup>
+
+## How the layers relate
+
+| Layer | Package | What it gives you |
+|---|---|---|
+| Components | `components/*` | Interface contracts and option types for each AI primitive |
+| Composition | `compose` | Graph, Chain, Workflow, ToolsNode, Runnable |
+| ADK | `adk` | Agent, Runner, AsyncIterator, ResumableAgent, prebuilt patterns |
+
+You can stop at any layer. A standalone `Retriever` or `ChatModel` works without any graph. A graph works without any agent. And agents are just a structured pattern for running graphs in a loop with tool dispatch.
+
+## Extension repository
+
+Official component implementations (OpenAI, Ollama, Claude, Gemini, Ark, Elasticsearch, Redis, and more) are maintained separately in [eino-ext](https://github.com/cloudwego/eino-ext). The core `eino` repository contains only the interface definitions, the composition engine, the ADK runtime, and the streaming infrastructure. This separation keeps the core dependency-free and lets implementations evolve independently.
+
+## Explore each concept
+
+<CardGroup cols={2}>
+  <Card title="Components" icon="puzzle-piece" href="/concepts/components">
+    All component interfaces with their exact method signatures extracted from source.
+  </Card>
+  <Card title="Composition" icon="diagram-project" href="/concepts/composition">
+    Graph, Chain, and Workflow builders, plus the four runnable execution modes.
+  </Card>
+  <Card title="Agents" icon="robot" href="/concepts/agents">
+    The Agent interface, the Runner entry point, the ReAct loop, and human-in-the-loop.
+  </Card>
+  <Card title="Streaming" icon="wave-sine" href="/composition/streaming">
+    How Eino automatically handles stream propagation, concatenation, and fan-out.
+  </Card>
+</CardGroup>
